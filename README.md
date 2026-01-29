@@ -19,3 +19,4 @@ Memory-enhanced chat backend for SoulPrint.
 pip install -r requirements.txt
 uvicorn main:app --reload --port 8100
 ```
+# Trigger deploy Thu Jan 29 12:19:35 CST 2026
