@@ -230,3 +230,4 @@ async def status():
         "alerts_configured": bool(ALERT_TELEGRAM_BOT),
         "timestamp": datetime.utcnow().isoformat(),
     }
+
