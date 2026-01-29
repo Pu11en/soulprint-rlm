@@ -177,24 +177,29 @@ async def query(request: QueryRequest):
         # Build context
         context = build_context(chunks, soulprint, request.history or [])
         
-        # Initialize RLM with timeout handling
-        import anthropic
+        # Initialize RLM with OpenAI backend (avoids Anthropic streaming requirement)
+        # OpenAI doesn't have the 10-minute streaming mandate
+        OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
         
-        # Create Anthropic client with shorter timeout to avoid streaming requirement
-        anthropic_client = anthropic.Anthropic(
-            api_key=ANTHROPIC_API_KEY,
-            timeout=300.0,  # 5 minutes max
-        )
-        
-        rlm = RLM(
-            backend="anthropic",
-            backend_kwargs={
-                "model_name": "claude-sonnet-4-20250514",
-                "api_key": ANTHROPIC_API_KEY,
-                "client": anthropic_client,  # Use pre-configured client
-            },
-            verbose=False,
-        )
+        if OPENAI_API_KEY:
+            rlm = RLM(
+                backend="openai",
+                backend_kwargs={
+                    "model_name": "gpt-4o",
+                    "api_key": OPENAI_API_KEY,
+                },
+                verbose=False,
+            )
+        else:
+            # Fallback to Anthropic with streaming workaround
+            rlm = RLM(
+                backend="anthropic",
+                backend_kwargs={
+                    "model_name": "claude-sonnet-4-20250514",
+                    "api_key": ANTHROPIC_API_KEY,
+                },
+                verbose=False,
+            )
         
         # Limit context to avoid timeout (RLM will explore as needed)
         limited_context = context[:15000] if len(context) > 15000 else context
