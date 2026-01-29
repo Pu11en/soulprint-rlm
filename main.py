@@ -1,26 +1,34 @@
 """
 SoulPrint RLM Service
-Provides memory-enhanced chat using Recursive Language Models
+TRUE Recursive Language Models - no fallback, memory is critical
 """
 import os
 import json
 import httpx
-from datetime import datetime, timedelta
+import time
+from datetime import datetime
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# Load environment variables
+# Import RLM - REQUIRED, no fallback
+try:
+    from rlm import RLM
+    RLM_AVAILABLE = True
+except ImportError as e:
+    RLM_AVAILABLE = False
+    RLM_IMPORT_ERROR = str(e)
+
 load_dotenv()
 
 app = FastAPI(title="SoulPrint RLM Service")
 
-# CORS for Next.js
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://*.vercel.app"],
+    allow_origins=["*"],  # Render handles CORS
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,7 +38,8 @@ app.add_middleware(
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-ALERT_WEBHOOK = os.getenv("ALERT_WEBHOOK")  # Optional: for failure alerts
+ALERT_TELEGRAM_BOT = os.getenv("ALERT_TELEGRAM_BOT")
+ALERT_TELEGRAM_CHAT = os.getenv("ALERT_TELEGRAM_CHAT", "7414639817")  # Drew's Telegram
 
 
 class QueryRequest(BaseModel):
@@ -43,63 +52,132 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     response: str
     chunks_used: int
-    method: str  # "rlm" or "fallback"
+    method: str
     latency_ms: int
 
 
-async def get_conversation_chunks(user_id: str, recent_only: bool = True) -> List[dict]:
-    """Fetch conversation chunks from Supabase"""
-    async with httpx.AsyncClient() as client:
-        query = f"{SUPABASE_URL}/rest/v1/conversation_chunks"
-        params = {
-            "user_id": f"eq.{user_id}",
-            "select": "conversation_id,title,content,message_count,created_at",
-            "order": "created_at.desc",
-            "limit": "100",
-        }
-        if recent_only:
-            params["is_recent"] = "eq.true"
-        
-        response = await client.get(
-            query,
-            params=params,
-            headers={
-                "apikey": SUPABASE_SERVICE_KEY,
-                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-            },
-        )
-        
-        if response.status_code != 200:
-            raise Exception(f"Supabase error: {response.text}")
-        
-        return response.json()
-
-
-async def alert_failure(error: str, user_id: str, message: str):
-    """Alert Drew about failures"""
-    if not ALERT_WEBHOOK:
-        print(f"[ALERT] RLM failure for user {user_id}: {error}")
+async def alert_drew(message: str):
+    """Alert Drew on Telegram when something is wrong"""
+    if not ALERT_TELEGRAM_BOT:
+        print(f"[ALERT - NO BOT CONFIGURED] {message}")
         return
     
     try:
         async with httpx.AsyncClient() as client:
-            await client.post(ALERT_WEBHOOK, json={
-                "text": f"🚨 SoulPrint RLM Failure\nUser: {user_id}\nError: {error}\nMessage: {message[:100]}",
-            })
+            await client.post(
+                f"https://api.telegram.org/bot{ALERT_TELEGRAM_BOT}/sendMessage",
+                json={
+                    "chat_id": ALERT_TELEGRAM_CHAT,
+                    "text": f"🚨 SoulPrint RLM Alert\n\n{message}",
+                    "parse_mode": "HTML",
+                }
+            )
     except Exception as e:
-        print(f"Failed to send alert: {e}")
+        print(f"Failed to alert Drew: {e}")
 
 
-async def query_with_rlm(
-    message: str,
-    conversation_context: str,
-    soulprint_text: str,
-    history: List[dict],
-) -> str:
-    """Query using RLM for recursive memory exploration"""
-    try:
-        from rlm import RLM
+async def get_user_data(user_id: str) -> tuple[List[dict], Optional[str]]:
+    """Fetch conversation chunks and soulprint from Supabase"""
+    async with httpx.AsyncClient() as client:
+        headers = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        }
         
+        # Get chunks
+        chunks_response = await client.get(
+            f"{SUPABASE_URL}/rest/v1/conversation_chunks",
+            params={
+                "user_id": f"eq.{user_id}",
+                "select": "conversation_id,title,content,message_count,created_at",
+                "order": "created_at.desc",
+                "limit": "200",
+            },
+            headers=headers,
+        )
+        
+        # Get soulprint
+        profile_response = await client.get(
+            f"{SUPABASE_URL}/rest/v1/user_profiles",
+            params={
+                "user_id": f"eq.{user_id}",
+                "select": "soulprint_text",
+            },
+            headers=headers,
+        )
+        
+        chunks = chunks_response.json() if chunks_response.status_code == 200 else []
+        profile = profile_response.json()
+        soulprint_text = profile[0]["soulprint_text"] if profile else None
+        
+        return chunks, soulprint_text
+
+
+def build_context(chunks: List[dict], soulprint_text: Optional[str], history: List[dict]) -> str:
+    """Build the context string for RLM"""
+    context_parts = []
+    
+    if soulprint_text:
+        context_parts.append(f"## User Profile\n{soulprint_text}")
+    
+    if chunks:
+        context_parts.append("## Conversation History")
+        for chunk in chunks[:100]:  # Top 100 most recent
+            context_parts.append(f"\n### {chunk['title']}\n{chunk['content'][:2000]}")
+    
+    if history:
+        recent_history = json.dumps(history[-10:], indent=2)
+        context_parts.append(f"## Current Conversation\n{recent_history}")
+    
+    return "\n\n".join(context_parts)
+
+
+@app.on_event("startup")
+async def startup():
+    """Check RLM availability on startup"""
+    if not RLM_AVAILABLE:
+        await alert_drew(f"RLM LIBRARY NOT AVAILABLE!\n\nImport error: {RLM_IMPORT_ERROR}\n\nService will return errors until fixed.")
+    else:
+        print("[RLM] Library loaded successfully")
+
+
+@app.get("/health")
+async def health():
+    """Health check - returns error if RLM not available"""
+    if not RLM_AVAILABLE:
+        raise HTTPException(status_code=503, detail=f"RLM not available: {RLM_IMPORT_ERROR}")
+    return {
+        "status": "ok",
+        "service": "soulprint-rlm",
+        "rlm_available": True,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+@app.post("/query", response_model=QueryResponse)
+async def query(request: QueryRequest):
+    """Main query endpoint - TRUE RLM, NO FALLBACK"""
+    start = time.time()
+    
+    # CRITICAL: RLM must be available
+    if not RLM_AVAILABLE:
+        await alert_drew(f"Query failed - RLM not available\nUser: {request.user_id}")
+        raise HTTPException(
+            status_code=503,
+            detail="Memory service unavailable. Please try again later."
+        )
+    
+    try:
+        # Fetch user data
+        chunks, soulprint_text = await get_user_data(request.user_id)
+        
+        # Use provided soulprint or fetched
+        soulprint = request.soulprint_text or soulprint_text
+        
+        # Build context
+        context = build_context(chunks, soulprint, request.history or [])
+        
+        # Initialize RLM
         rlm = RLM(
             backend="anthropic",
             backend_kwargs={
@@ -109,134 +187,46 @@ async def query_with_rlm(
             verbose=False,
         )
         
-        # Build the context for RLM
-        context = f"""You are SoulPrint, a personal AI assistant with access to the user's conversation history.
+        # Build the RLM prompt
+        prompt = f"""You are SoulPrint, a personal AI with infinite memory of the user's conversation history.
 
-## User Profile (SoulPrint)
-{soulprint_text or "No profile available yet."}
+{context}
 
-## Conversation History
-The following is the user's conversation history that you can explore and reference:
+## Instructions
+- Use the conversation history to provide personalized, contextual responses
+- Reference relevant past conversations naturally
+- Be warm and helpful
+- If asked about past conversations, search through the history programmatically
 
-{conversation_context}
+User's message: {request.message}"""
 
-## Current Conversation
-{json.dumps(history[-5:] if history else [], indent=2)}
-
-## Task
-Respond to the user's message naturally, using relevant context from their history when appropriate.
-Don't explicitly mention "according to your history" unless it's natural.
-Be helpful, personalized, and conversational.
-
-User message: {message}"""
-
-        result = rlm.completion(context)
-        return result.response
+        # Execute RLM query
+        result = rlm.completion(prompt)
         
-    except ImportError:
-        # RLM not installed, use direct Anthropic
-        raise Exception("RLM library not available")
-
-
-async def query_fallback(
-    message: str,
-    conversation_context: str,
-    soulprint_text: str,
-    history: List[dict],
-) -> str:
-    """Fallback to direct Anthropic API if RLM fails"""
-    import anthropic
-    
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    
-    system_prompt = f"""You are SoulPrint, a personal AI assistant with memory of the user's past conversations.
-
-## User Profile
-{soulprint_text or "No profile available yet."}
-
-## Recent Conversation History (for context)
-{conversation_context[:8000] if conversation_context else "No history available yet."}
-
-Guidelines:
-- Be warm, personalized, and helpful
-- Reference relevant memories naturally when appropriate
-- Don't overwhelm with information
-- If you don't have relevant context, just be helpful in the moment"""
-
-    messages = []
-    for h in (history or [])[-10:]:
-        messages.append({"role": h["role"], "content": h["content"]})
-    messages.append({"role": "user", "content": message})
-
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4096,
-        system=system_prompt,
-        messages=messages,
-    )
-    
-    return response.content[0].text
-
-
-@app.get("/health")
-async def health():
-    """Health check endpoint"""
-    return {"status": "ok", "service": "soulprint-rlm"}
-
-
-@app.post("/query", response_model=QueryResponse)
-async def query(request: QueryRequest):
-    """Main query endpoint - uses RLM with fallback"""
-    import time
-    start = time.time()
-    
-    try:
-        # Fetch conversation chunks
-        chunks = await get_conversation_chunks(request.user_id, recent_only=True)
-        
-        # Build context from chunks
-        conversation_context = ""
-        for chunk in chunks[:50]:  # Limit to 50 most recent
-            conversation_context += f"\n---\n**{chunk.get('title', 'Untitled')}** ({chunk.get('created_at', 'unknown date')})\n"
-            conversation_context += chunk.get('content', '')[:2000]  # Truncate long convos
-        
-        # Try RLM first
-        try:
-            response = await query_with_rlm(
-                message=request.message,
-                conversation_context=conversation_context,
-                soulprint_text=request.soulprint_text or "",
-                history=request.history or [],
-            )
-            method = "rlm"
-        except Exception as rlm_error:
-            # Log and alert on RLM failure
-            print(f"[RLM] Falling back due to: {rlm_error}")
-            await alert_failure(str(rlm_error), request.user_id, request.message)
-            
-            # Fallback to direct API
-            response = await query_fallback(
-                message=request.message,
-                conversation_context=conversation_context,
-                soulprint_text=request.soulprint_text or "",
-                history=request.history or [],
-            )
-            method = "fallback"
-        
-        latency_ms = int((time.time() - start) * 1000)
+        latency = int((time.time() - start) * 1000)
         
         return QueryResponse(
-            response=response,
+            response=result.response,
             chunks_used=len(chunks),
-            method=method,
-            latency_ms=latency_ms,
+            method="rlm",
+            latency_ms=latency,
         )
         
     except Exception as e:
-        await alert_failure(str(e), request.user_id, request.message)
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = str(e)
+        await alert_drew(f"RLM Query Error\n\nUser: {request.user_id}\nError: {error_msg[:500]}")
+        raise HTTPException(status_code=500, detail=f"Memory query failed: {error_msg}")
 
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8100)
+@app.get("/status")
+async def status():
+    """Detailed status for monitoring"""
+    return {
+        "service": "soulprint-rlm",
+        "rlm_available": RLM_AVAILABLE,
+        "rlm_error": RLM_IMPORT_ERROR if not RLM_AVAILABLE else None,
+        "supabase_configured": bool(SUPABASE_URL and SUPABASE_SERVICE_KEY),
+        "anthropic_configured": bool(ANTHROPIC_API_KEY),
+        "alerts_configured": bool(ALERT_TELEGRAM_BOT),
+        "timestamp": datetime.utcnow().isoformat(),
+    }
