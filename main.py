@@ -177,31 +177,60 @@ async def query(request: QueryRequest):
         # Build context
         context = build_context(chunks, soulprint, request.history or [])
         
-        # Initialize RLM
+        # Initialize RLM with timeout handling
+        import anthropic
+        
+        # Create Anthropic client with shorter timeout to avoid streaming requirement
+        anthropic_client = anthropic.Anthropic(
+            api_key=ANTHROPIC_API_KEY,
+            timeout=300.0,  # 5 minutes max
+        )
+        
         rlm = RLM(
             backend="anthropic",
             backend_kwargs={
                 "model_name": "claude-sonnet-4-20250514",
                 "api_key": ANTHROPIC_API_KEY,
+                "client": anthropic_client,  # Use pre-configured client
             },
             verbose=False,
         )
         
+        # Limit context to avoid timeout (RLM will explore as needed)
+        limited_context = context[:15000] if len(context) > 15000 else context
+        
         # Build the RLM prompt
         prompt = f"""You are SoulPrint, a personal AI with infinite memory of the user's conversation history.
 
-{context}
+{limited_context}
 
 ## Instructions
 - Use the conversation history to provide personalized, contextual responses
 - Reference relevant past conversations naturally
 - Be warm and helpful
 - If asked about past conversations, search through the history programmatically
+- Keep responses focused and concise
 
 User's message: {request.message}"""
 
-        # Execute RLM query
-        result = rlm.completion(prompt)
+        # Execute RLM query with error handling
+        try:
+            result = rlm.completion(prompt)
+        except Exception as rlm_error:
+            # If RLM fails (timeout, etc), fall back to direct Anthropic
+            print(f"[RLM] RLM execution failed: {rlm_error}, using direct call")
+            import anthropic
+            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=2048,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            # Create a mock result object
+            class MockResult:
+                def __init__(self, text):
+                    self.response = text
+            result = MockResult(response.content[0].text)
         
         latency = int((time.time() - start) * 1000)
         
