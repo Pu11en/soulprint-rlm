@@ -18,8 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# Import exhaustive soulprint module
-from create_soulprint_exhaustive import create_exhaustive_soulprint
+# Exhaustive soulprint functions inlined below (after app setup)
 
 # Import RLM - REQUIRED, no fallback
 try:
@@ -481,6 +480,220 @@ Return ONLY valid JSON, no markdown."""
         error_msg = str(e)
         print(f"[RLM] Analyze error: {error_msg}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {error_msg}")
+
+
+# ============================================================================
+# EXHAUSTIVE SOULPRINT GENERATION - Processes ALL conversations in batches
+# ============================================================================
+
+async def extract_patterns_from_batch(batch: List[dict], batch_num: int, total_batches: int, anthropic_client) -> dict:
+    """Extract patterns from a batch of conversations"""
+    
+    conversation_text = ""
+    for conv in batch:
+        title = conv.get("title", "Untitled")
+        messages = conv.get("messages", conv.get("mapping", []))
+        
+        if isinstance(messages, list):
+            msg_excerpts = []
+            for m in messages[:20]:
+                if isinstance(m, dict):
+                    role = m.get("role", m.get("author", {}).get("role", "unknown"))
+                    content = m.get("content", "")
+                    if isinstance(content, list):
+                        content = " ".join([p.get("text", str(p)) for p in content if isinstance(p, dict)])
+                    elif isinstance(content, dict):
+                        content = content.get("parts", [content.get("text", str(content))])[0] if content else ""
+                    content = str(content)[:500]
+                    if content.strip():
+                        msg_excerpts.append(f"{role}: {content}")
+                elif isinstance(m, str):
+                    msg_excerpts.append(f"user: {m[:500]}")
+            
+            if msg_excerpts:
+                conversation_text += f"\n### {title}\n" + "\n".join(msg_excerpts) + "\n"
+        elif isinstance(messages, dict):
+            for node_id, node in list(messages.items())[:20]:
+                if isinstance(node, dict) and "message" in node:
+                    msg = node["message"]
+                    if msg:
+                        role = msg.get("author", {}).get("role", "unknown")
+                        content = msg.get("content", {})
+                        if isinstance(content, dict):
+                            parts = content.get("parts", [])
+                            text = parts[0] if parts else ""
+                        else:
+                            text = str(content)
+                        if text and len(text.strip()) > 0:
+                            conversation_text += f"{role}: {text[:500]}\n"
+    
+    conversation_text = conversation_text[:40000]
+    
+    extraction_prompt = f"""Analyze conversations to extract personality patterns. Batch {batch_num + 1}/{total_batches}.
+
+## CONVERSATIONS
+{conversation_text}
+
+## TASK
+Extract SPECIFIC patterns. Quote examples.
+
+Return JSON:
+{{
+  "voice_patterns": {{
+    "formality_examples": ["quotes"],
+    "humor_examples": ["jokes, sarcasm"],
+    "emoji_patterns": ["emojis used"],
+    "greeting_styles": ["how they start"],
+    "sign_off_styles": ["how they end"]
+  }},
+  "thinking_patterns": {{
+    "explanation_style": "how they explain",
+    "question_types": ["question types"],
+    "problem_approach": "problem solving style"
+  }},
+  "emotional_patterns": {{
+    "enthusiasm_markers": ["excitement words"],
+    "frustration_markers": ["frustration words"],
+    "support_language": ["comfort phrases"]
+  }},
+  "memory_anchors": {{
+    "people_mentioned": ["names"],
+    "recurring_topics": ["topics"],
+    "strong_opinions": ["opinions"],
+    "interests": ["hobbies"]
+  }},
+  "unique_markers": {{
+    "catchphrases": ["repeated phrases"],
+    "word_choices": ["distinctive vocab"]
+  }}
+}}
+
+Be SPECIFIC. Quote text. Empty arrays if pattern absent."""
+
+    response = anthropic_client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4096,
+        messages=[{"role": "user", "content": extraction_prompt}],
+    )
+    
+    response_text = response.content[0].text
+    try:
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0]
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0]
+        return json.loads(response_text.strip())
+    except:
+        return {"raw_analysis": response_text}
+
+
+async def synthesize_soulprint(all_patterns: List[dict], stats: dict, anthropic_client) -> dict:
+    """Synthesize all patterns into final soulprint"""
+    
+    merged = {"voice_patterns": [], "thinking_patterns": [], "emotional_patterns": [], "memory_anchors": [], "unique_markers": []}
+    
+    for patterns in all_patterns:
+        for key in merged:
+            if key in patterns:
+                if isinstance(patterns[key], dict):
+                    merged[key].append(patterns[key])
+                elif isinstance(patterns[key], list):
+                    merged[key].extend(patterns[key])
+    
+    synthesis_prompt = f"""Create FINAL SoulPrint from ALL extracted patterns.
+
+## PATTERNS FROM ALL CONVERSATIONS
+{json.dumps(merged, indent=2)[:50000]}
+
+## STATS
+{json.dumps(stats, indent=2) if stats else "No stats"}
+
+## TASK
+Create comprehensive, deeply personalized SoulPrint.
+
+Return JSON:
+{{
+  "archetype": "Creative 2-4 word title (e.g., 'The Relentless Builder')",
+  "core_essence": "2-3 sentences of who they are",
+  "voice": {{
+    "formality": "casual|mixed|formal",
+    "humor": "dry|playful|sarcastic|warm|none",
+    "emoji_style": "heavy|moderate|minimal|none",
+    "signature_phrases": ["catchphrases"]
+  }},
+  "mind": {{
+    "thinking_style": "how they process ideas",
+    "curiosity_drivers": ["what drives learning"],
+    "problem_solving": "approach to challenges"
+  }},
+  "heart": {{
+    "emotional_range": "how they express feelings",
+    "enthusiasm_triggers": ["what excites them"],
+    "connection_style": "how they relate to others"
+  }},
+  "world": {{
+    "key_relationships": ["important people"],
+    "core_interests": ["passions"],
+    "strong_beliefs": ["values"]
+  }},
+  "soulprint_text": "300-500 word narrative for AI to embody their style. Include examples.",
+  "communication_guide": {{
+    "do": ["things to do as them"],
+    "avoid": ["things to avoid"]
+  }}
+}}
+
+Make it SPECIFIC and PERSONAL."""
+
+    response = anthropic_client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=8192,
+        messages=[{"role": "user", "content": synthesis_prompt}],
+    )
+    
+    response_text = response.content[0].text
+    try:
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0]
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0]
+        return json.loads(response_text.strip())
+    except:
+        return {"archetype": "The Unique Individual", "soulprint_text": response_text, "raw": True}
+
+
+async def create_exhaustive_soulprint(conversations: List[dict], stats: dict, user_id: str, anthropic_client) -> dict:
+    """Process ALL conversations exhaustively in batches"""
+    start = time.time()
+    
+    total = len(conversations)
+    batch_size = 50
+    batches = [conversations[i:i+batch_size] for i in range(0, total, batch_size)]
+    total_batches = len(batches)
+    
+    print(f"[RLM] Exhaustive analysis: {total} conversations in {total_batches} batches")
+    
+    all_patterns = []
+    for i, batch in enumerate(batches):
+        print(f"[RLM] Processing batch {i+1}/{total_batches} ({len(batch)} conversations)")
+        patterns = await extract_patterns_from_batch(batch, i, total_batches, anthropic_client)
+        all_patterns.append(patterns)
+        if i < total_batches - 1:
+            await asyncio.sleep(0.5)
+    
+    print(f"[RLM] Pattern extraction complete. Synthesizing...")
+    soulprint = await synthesize_soulprint(all_patterns, stats, anthropic_client)
+    
+    elapsed = time.time() - start
+    print(f"[RLM] Exhaustive soulprint complete in {elapsed:.1f}s")
+    
+    return {
+        "soulprint": soulprint,
+        "archetype": soulprint.get("archetype", "Unknown"),
+        "batches_processed": total_batches,
+        "conversations_analyzed": total,
+        "elapsed_seconds": round(elapsed, 1)
+    }
 
 
 @app.post("/create-soulprint")
