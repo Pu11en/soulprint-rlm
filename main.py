@@ -63,6 +63,12 @@ class AnalyzeRequest(BaseModel):
     user_id: str
 
 
+class CreateSoulprintRequest(BaseModel):
+    user_id: str
+    conversations: List[dict]
+    stats: Optional[dict] = None
+
+
 async def alert_drew(message: str):
     """Alert Drew on Telegram when something is wrong"""
     if not ALERT_TELEGRAM_BOT:
@@ -469,6 +475,267 @@ Return ONLY valid JSON, no markdown."""
         error_msg = str(e)
         print(f"[RLM] Analyze error: {error_msg}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {error_msg}")
+
+
+@app.post("/create-soulprint")
+async def create_soulprint(request: CreateSoulprintRequest):
+    """
+    Generate a soulprint from conversation data using RLM.
+    Called by the landing app during import flow.
+    
+    Uses SoulPrint Quality Criteria to capture:
+    - Voice Profile (formality, humor, emoji patterns)
+    - Thinking Style (explanation patterns, problem-solving)
+    - Emotional Signature (enthusiasm, frustration, support)
+    - Context Adaptation (professional vs personal)
+    - Memory Anchors (people, events, preferences)
+    """
+    start = time.time()
+    
+    try:
+        conversations = request.conversations
+        stats = request.stats or {}
+        user_id = request.user_id
+        
+        if not conversations:
+            return {"error": "No conversations provided", "soulprint": None, "archetype": None}
+        
+        print(f"[RLM] Creating soulprint for user {user_id} from {len(conversations)} conversations")
+        
+        # Strategic sampling for comprehensive analysis
+        # Recent conversations (current voice)
+        recent = conversations[:50]
+        
+        # Oldest conversations (historical patterns)
+        oldest = conversations[-30:] if len(conversations) > 50 else []
+        
+        # Longest conversations (depth of engagement)
+        by_length = sorted(conversations, key=lambda c: c.get("message_count", len(c.get("messages", []))), reverse=True)
+        longest = by_length[:50]
+        
+        # Deduplicate while preserving order
+        seen = set()
+        sampled = []
+        for conv in recent + longest + oldest:
+            conv_id = conv.get("id") or conv.get("title", "") + str(conv.get("created_at", ""))
+            if conv_id not in seen:
+                seen.add(conv_id)
+                sampled.append(conv)
+        
+        # Build conversation text for analysis
+        conversation_text = ""
+        for conv in sampled[:100]:  # Max 100 for token limits
+            title = conv.get("title", "Untitled")
+            messages = conv.get("messages", conv.get("mapping", []))
+            
+            # Handle different message formats
+            if isinstance(messages, list):
+                msg_excerpts = []
+                for m in messages[:15]:  # First 15 messages per conversation
+                    if isinstance(m, dict):
+                        role = m.get("role", m.get("author", {}).get("role", "unknown"))
+                        content = m.get("content", "")
+                        if isinstance(content, list):
+                            content = " ".join([p.get("text", str(p)) for p in content if isinstance(p, dict)])
+                        elif isinstance(content, dict):
+                            content = content.get("parts", [content.get("text", str(content))])[0] if content else ""
+                        content = str(content)[:300]  # Truncate long messages
+                        if content.strip():
+                            msg_excerpts.append(f"  {role}: {content}")
+                    elif isinstance(m, str):
+                        msg_excerpts.append(f"  user: {m[:300]}")
+                
+                if msg_excerpts:
+                    conversation_text += f"\n### {title}\n" + "\n".join(msg_excerpts) + "\n"
+            elif isinstance(messages, dict):
+                # Handle OpenAI/ChatGPT mapping format
+                for node_id, node in list(messages.items())[:15]:
+                    if isinstance(node, dict) and "message" in node:
+                        msg = node["message"]
+                        if msg:
+                            role = msg.get("author", {}).get("role", "unknown")
+                            content = msg.get("content", {})
+                            if isinstance(content, dict):
+                                parts = content.get("parts", [])
+                                text = parts[0] if parts else ""
+                            else:
+                                text = str(content)
+                            if text and len(text.strip()) > 0:
+                                conversation_text += f"  {role}: {text[:300]}\n"
+        
+        # Truncate to fit token limits
+        conversation_text = conversation_text[:50000]
+        
+        # Build the soulprint generation prompt using quality criteria
+        soulprint_prompt = f"""You are creating a SoulPrint - a deeply personalized profile that captures someone's unique essence from their conversations.
+
+## CONVERSATION HISTORY
+{conversation_text}
+
+## ANALYSIS STATS
+{json.dumps(stats, indent=2) if stats else "No stats provided"}
+
+## YOUR TASK
+Analyze these conversations to create a comprehensive SoulPrint. You must capture:
+
+### 1. VOICE PROFILE
+- Formality spectrum (casual ↔ formal)
+- Humor style (dry, silly, sarcastic, playful, none)
+- Emoji/punctuation patterns
+- Typical message length and rhythm
+- How they start and end messages
+
+### 2. THINKING STYLE
+- How they explain things to others
+- Question-asking patterns
+- Problem-solving approach
+- Decision-making style
+- How they build arguments
+
+### 3. EMOTIONAL SIGNATURE
+- How they express enthusiasm
+- How they handle frustration
+- How they comfort and support others
+- Their vulnerability level
+- Emotional range in communication
+
+### 4. CONTEXT ADAPTATION
+- Professional vs personal tone shifts
+- How they adjust for different audiences
+- Topic-specific tone changes
+
+### 5. MEMORY ANCHORS
+- Important people mentioned frequently
+- Significant events or dates
+- Strong preferences and opinions
+- Recurring interests and passions
+- Things they care deeply about
+
+## OUTPUT FORMAT
+Return a JSON object with these exact fields:
+
+{{
+  "archetype": "A creative 2-3 word archetype title (e.g., 'The Curious Builder', 'The Thoughtful Explorer')",
+  "summary": "A 2-3 sentence essence of who this person is",
+  "voice": {{
+    "formality": "casual|mixed|formal",
+    "humor": "dry|playful|sarcastic|warm|none",
+    "emoji_usage": "heavy|moderate|minimal|none",
+    "message_style": "brief|moderate|detailed",
+    "punctuation_quirks": ["list of any notable patterns"]
+  }},
+  "thinking": {{
+    "explanation_style": "how they explain things",
+    "problem_solving": "their approach to problems",
+    "curiosity_areas": ["top interests/topics"],
+    "decision_style": "how they make decisions"
+  }},
+  "emotional": {{
+    "enthusiasm_expression": "how they show excitement",
+    "frustration_handling": "how they deal with frustration",
+    "support_style": "how they comfort others",
+    "vulnerability": "low|moderate|high"
+  }},
+  "memory_anchors": {{
+    "key_people": ["important names mentioned"],
+    "recurring_topics": ["topics they return to"],
+    "strong_opinions": ["things they feel strongly about"],
+    "preferences": ["clear likes/dislikes"]
+  }},
+  "soulprint_text": "A rich, narrative description of this person in 200-400 words that an AI could use to embody their communication style"
+}}
+
+CRITICAL: Return ONLY valid JSON, no markdown code blocks, no explanations outside the JSON."""
+
+        # Use RLM or direct Anthropic
+        analysis_text = None
+        
+        if RLM_AVAILABLE:
+            try:
+                rlm = RLM(
+                    backend="anthropic",
+                    backend_kwargs={
+                        "model_name": "claude-sonnet-4-20250514",
+                        "api_key": ANTHROPIC_API_KEY,
+                    },
+                    verbose=False,
+                )
+                result = rlm.completion(soulprint_prompt)
+                analysis_text = result.response
+            except Exception as e:
+                print(f"[RLM] Create soulprint RLM failed, using direct: {e}")
+        
+        if not analysis_text:
+            import anthropic
+            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=4096,
+                messages=[{"role": "user", "content": soulprint_prompt}],
+            )
+            analysis_text = response.content[0].text
+        
+        # Parse JSON from response
+        try:
+            # Try to extract JSON from response
+            json_match = re.search(r'\{[\s\S]*\}', analysis_text)
+            if json_match:
+                soulprint_data = json.loads(json_match.group())
+            else:
+                raise ValueError("No JSON found in response")
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"[RLM] Failed to parse soulprint JSON: {e}")
+            # Return a structured fallback
+            soulprint_data = {
+                "archetype": "Unique Individual",
+                "summary": "A person with a distinct voice and perspective.",
+                "soulprint_text": analysis_text[:1000] if analysis_text else "Profile generation in progress.",
+                "raw_response": analysis_text[:2000] if analysis_text else None,
+            }
+        
+        archetype = soulprint_data.get("archetype", "Unique Individual")
+        
+        # Store to Supabase if configured
+        if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+            try:
+                async with httpx.AsyncClient() as client:
+                    headers = {
+                        "apikey": SUPABASE_SERVICE_KEY,
+                        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                        "Content-Type": "application/json",
+                        "Prefer": "return=minimal",
+                    }
+                    
+                    # Upsert user profile with soulprint
+                    await client.post(
+                        f"{SUPABASE_URL}/rest/v1/user_profiles",
+                        headers={**headers, "Prefer": "resolution=merge-duplicates"},
+                        json={
+                            "user_id": user_id,
+                            "soulprint": soulprint_data,
+                            "soulprint_text": soulprint_data.get("soulprint_text", ""),
+                            "archetype": archetype,
+                            "soulprint_updated_at": datetime.utcnow().isoformat(),
+                        },
+                    )
+                    print(f"[RLM] Stored soulprint for user {user_id}")
+            except Exception as e:
+                print(f"[RLM] Failed to store soulprint: {e}")
+        
+        latency = int((time.time() - start) * 1000)
+        
+        return {
+            "soulprint": soulprint_data,
+            "archetype": archetype,
+            "conversations_analyzed": len(sampled),
+            "latency_ms": latency,
+        }
+        
+    except Exception as e:
+        error_msg = str(e)
+        print(f"[RLM] Create soulprint error: {error_msg}")
+        await alert_drew(f"Create Soulprint Error\n\nUser: {request.user_id}\nError: {error_msg[:500]}")
+        raise HTTPException(status_code=500, detail=f"Soulprint creation failed: {error_msg}")
 
 
 @app.get("/status")
