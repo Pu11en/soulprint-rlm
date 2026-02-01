@@ -2320,18 +2320,28 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
             embedded_count = 0
             PARALLEL_BATCH_SIZE = 5  # Balanced: 5 concurrent embeddings
 
+            consecutive_failures = 0
+            MAX_CONSECUTIVE_FAILURES = 10  # Abort if 10 in a row fail
+
             async def embed_and_store(chunk: dict) -> bool:
                 """Embed a single chunk and store to Supabase."""
                 try:
                     embedding = await embed_text_bedrock(chunk["content"], bedrock_client)
-                    if embedding:
-                        await client.patch(
-                            f"{SUPABASE_URL}/rest/v1/conversation_chunks",
-                            params={"id": f"eq.{chunk['id']}"},
-                            headers=headers,
-                            json={"embedding": embedding},
-                        )
-                        return True
+                    if not embedding:
+                        print(f"[RLM] No embedding returned for chunk {chunk['id']}")
+                        return False
+
+                    # PATCH and verify it worked
+                    patch_resp = await client.patch(
+                        f"{SUPABASE_URL}/rest/v1/conversation_chunks",
+                        params={"id": f"eq.{chunk['id']}"},
+                        headers=headers,
+                        json={"embedding": embedding},
+                    )
+                    if patch_resp.status_code not in (200, 204):
+                        print(f"[RLM] PATCH failed for {chunk['id']}: {patch_resp.status_code} - {patch_resp.text[:200]}")
+                        return False
+                    return True
                 except Exception as e:
                     print(f"[RLM] Embed error for {chunk['id']}: {e}")
                 return False
@@ -2340,7 +2350,23 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
             for batch_start in range(0, len(chunks_to_embed), PARALLEL_BATCH_SIZE):
                 batch = chunks_to_embed[batch_start:batch_start + PARALLEL_BATCH_SIZE]
                 results = await asyncio.gather(*[embed_and_store(c) for c in batch])
-                embedded_count += sum(results)
+
+                # Count successes and failures
+                batch_successes = sum(results)
+                batch_failures = len(results) - batch_successes
+                embedded_count += batch_successes
+
+                # Track consecutive failures
+                if batch_failures == len(results):
+                    consecutive_failures += len(results)
+                else:
+                    consecutive_failures = 0
+
+                # Abort if too many consecutive failures
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    error_msg = f"Aborting: {consecutive_failures} consecutive embedding failures"
+                    print(f"[RLM] {error_msg}")
+                    raise Exception(error_msg)
 
                 # Progress update every 50 chunks
                 if batch_start % 50 < PARALLEL_BATCH_SIZE:
@@ -2354,6 +2380,21 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
                     print(f"[RLM] Embedding progress: {progress}% ({embedded_count}/{len(chunks_to_embed)})")
 
                 await asyncio.sleep(0.1)  # Brief pause between batches
+
+            # Verify embeddings were actually saved
+            verify_resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/conversation_chunks",
+                params={
+                    "user_id": f"eq.{user_id}",
+                    "embedding": "not.is.null",
+                    "select": "id",
+                    "limit": "1",
+                },
+                headers=headers,
+            )
+            verified_chunks = verify_resp.json() if verify_resp.status_code == 200 else []
+            if not verified_chunks:
+                raise Exception("Embeddings not saved to database - verification failed")
 
             print(f"[RLM] Embedded {embedded_count}/{len(chunks_to_embed)} chunks")
 
