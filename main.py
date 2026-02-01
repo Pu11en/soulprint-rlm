@@ -1815,7 +1815,10 @@ async def create_soulprint(request: CreateSoulprintRequest):
 
 class ProcessFullRequest(BaseModel):
     user_id: str
-    conversations: Optional[List[dict]] = None  # Parsed conversations from Vercel
+    storage_path: Optional[str] = None  # Path to parsed JSON in Supabase Storage
+    conversation_count: Optional[int] = None
+    message_count: Optional[int] = None
+    conversations: Optional[List[dict]] = None  # Legacy: direct conversations (for small imports)
 
 
 @app.post("/process-full")
@@ -1823,14 +1826,25 @@ async def process_full(request: ProcessFullRequest, background_tasks: Background
     """
     Full processing pipeline: Create chunks → Embed → Generate SoulPrint.
     Called by Vercel after parsing ZIP. Runs in background - no timeout.
+
+    Supports two modes:
+    1. storage_path: RLM downloads parsed JSON from Supabase Storage (scalable, 10k+ convos)
+    2. conversations: Legacy direct passing (for small imports only)
     """
     print(f"[RLM] Received process-full request for user {request.user_id}")
-    print(f"[RLM] Conversations received: {len(request.conversations) if request.conversations else 0}")
+
+    if request.storage_path:
+        print(f"[RLM] Storage path: {request.storage_path} ({request.conversation_count} convos, {request.message_count} msgs)")
+    elif request.conversations:
+        print(f"[RLM] Direct conversations: {len(request.conversations)}")
+    else:
+        print(f"[RLM] No conversations provided")
 
     # Start background processing
     background_tasks.add_task(
         process_full_background,
         request.user_id,
+        request.storage_path,
         request.conversations
     )
 
@@ -1838,6 +1852,7 @@ async def process_full(request: ProcessFullRequest, background_tasks: Background
         "status": "processing",
         "message": "Full processing started: chunking → embedding → soulprint.",
         "user_id": request.user_id,
+        "conversation_count": request.conversation_count,
     }
 
 
@@ -1865,7 +1880,7 @@ async def embed_chunks(request: EmbedChunksRequest, background_tasks: Background
     }
 
 
-async def process_full_background(user_id: str, conversations: Optional[List[dict]]):
+async def process_full_background(user_id: str, storage_path: Optional[str], conversations: Optional[List[dict]] = None):
     """
     Full background pipeline: Create chunks → Embed → Generate SoulPrint.
 
@@ -1873,6 +1888,10 @@ async def process_full_background(user_id: str, conversations: Optional[List[dic
     - micro: 200 chars (precise facts, names, dates)
     - medium: 2000 chars (conversation context)
     - macro: 5000 chars (themes, relationships)
+
+    Supports:
+    - storage_path: Download parsed JSON from Supabase Storage (scalable)
+    - conversations: Direct list (legacy, for small imports)
     """
     start = time.time()
     print(f"[RLM] Starting full processing for user {user_id}")
@@ -1892,6 +1911,32 @@ async def process_full_background(user_id: str, conversations: Optional[List[dic
                 headers=headers,
                 json={"import_status": "processing", "embedding_status": "pending"},
             )
+
+            # ============================================================
+            # STEP 0: Get conversations (from storage or direct)
+            # ============================================================
+            if storage_path:
+                print(f"[RLM] Downloading parsed JSON from storage: {storage_path}")
+                # Parse bucket and path
+                path_parts = storage_path.split("/", 1)
+                bucket = path_parts[0]
+                file_path = path_parts[1] if len(path_parts) > 1 else ""
+
+                # Download from Supabase Storage
+                download_url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{file_path}"
+                download_resp = await client.get(download_url, headers=headers)
+
+                if download_resp.status_code != 200:
+                    print(f"[RLM] Storage download failed: {download_resp.status_code} - {download_resp.text[:200]}")
+                    raise Exception(f"Failed to download from storage: {download_resp.status_code}")
+
+                conversations = download_resp.json()
+                print(f"[RLM] Downloaded {len(conversations)} conversations from storage")
+
+                # Clean up storage file after download
+                delete_url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{file_path}"
+                await client.delete(delete_url, headers=headers)
+                print(f"[RLM] Cleaned up storage file: {storage_path}")
 
             if not conversations:
                 print(f"[RLM] No conversations provided, checking existing chunks...")
@@ -2030,9 +2075,9 @@ async def process_full_background(user_id: str, conversations: Optional[List[dic
             )
 
             # ============================================================
-            # STEP 3: Embed all chunks
+            # STEP 3: Embed all chunks (PARALLEL - balanced speed/cost)
             # ============================================================
-            print(f"[RLM] Embedding {inserted_count} chunks with Bedrock Titan...")
+            print(f"[RLM] Embedding {inserted_count} chunks with Bedrock Titan (parallel)...")
 
             # Fetch chunks we just inserted
             resp = await client.get(
@@ -2040,7 +2085,7 @@ async def process_full_background(user_id: str, conversations: Optional[List[dic
                 params={
                     "user_id": f"eq.{user_id}",
                     "select": "id,content",
-                    "limit": "5000",
+                    "limit": "10000",  # Support 10k+ conversations
                 },
                 headers=headers,
             )
@@ -2048,8 +2093,10 @@ async def process_full_background(user_id: str, conversations: Optional[List[dic
 
             bedrock_client = get_bedrock_client()
             embedded_count = 0
+            PARALLEL_BATCH_SIZE = 5  # Balanced: 5 concurrent embeddings
 
-            for i, chunk in enumerate(chunks_to_embed):
+            async def embed_and_store(chunk: dict) -> bool:
+                """Embed a single chunk and store to Supabase."""
                 try:
                     embedding = await embed_text_bedrock(chunk["content"], bedrock_client)
                     if embedding:
@@ -2059,23 +2106,29 @@ async def process_full_background(user_id: str, conversations: Optional[List[dic
                             headers=headers,
                             json={"embedding": embedding},
                         )
-                        embedded_count += 1
-
-                    # Progress update every 50
-                    if i % 50 == 0:
-                        progress = int((i + 1) / len(chunks_to_embed) * 100)
-                        await client.patch(
-                            f"{SUPABASE_URL}/rest/v1/user_profiles",
-                            params={"user_id": f"eq.{user_id}"},
-                            headers=headers,
-                            json={"embedding_progress": progress, "processed_chunks": embedded_count},
-                        )
-                        print(f"[RLM] Embedding progress: {progress}% ({embedded_count}/{len(chunks_to_embed)})")
-
-                    await asyncio.sleep(0.05)  # Rate limit
-
+                        return True
                 except Exception as e:
-                    print(f"[RLM] Embed error for chunk {chunk['id']}: {e}")
+                    print(f"[RLM] Embed error for {chunk['id']}: {e}")
+                return False
+
+            # Process in parallel batches
+            for batch_start in range(0, len(chunks_to_embed), PARALLEL_BATCH_SIZE):
+                batch = chunks_to_embed[batch_start:batch_start + PARALLEL_BATCH_SIZE]
+                results = await asyncio.gather(*[embed_and_store(c) for c in batch])
+                embedded_count += sum(results)
+
+                # Progress update every 50 chunks
+                if batch_start % 50 < PARALLEL_BATCH_SIZE:
+                    progress = int((batch_start + len(batch)) / len(chunks_to_embed) * 100)
+                    await client.patch(
+                        f"{SUPABASE_URL}/rest/v1/user_profiles",
+                        params={"user_id": f"eq.{user_id}"},
+                        headers=headers,
+                        json={"embedding_progress": progress, "processed_chunks": embedded_count},
+                    )
+                    print(f"[RLM] Embedding progress: {progress}% ({embedded_count}/{len(chunks_to_embed)})")
+
+                await asyncio.sleep(0.1)  # Brief pause between batches
 
             print(f"[RLM] Embedded {embedded_count}/{len(chunks_to_embed)} chunks")
 
@@ -2099,6 +2152,29 @@ async def process_full_background(user_id: str, conversations: Optional[List[dic
             )
 
             print(f"[RLM] Full processing complete in {elapsed:.1f}s")
+
+            # ============================================================
+            # STEP 5: Notify Vercel for email + push notification
+            # ============================================================
+            vercel_url = os.environ.get("VERCEL_API_URL", "https://www.soulprintengine.ai")
+            try:
+                callback_resp = await client.post(
+                    f"{vercel_url}/api/import/complete",
+                    json={
+                        "user_id": user_id,
+                        "chunks_embedded": embedded_count,
+                        "processing_time": elapsed,
+                    },
+                    headers={"Content-Type": "application/json"},
+                    timeout=30.0,
+                )
+                if callback_resp.status_code == 200:
+                    print(f"[RLM] Notified Vercel - email + push sent")
+                else:
+                    print(f"[RLM] Vercel callback returned {callback_resp.status_code}")
+            except Exception as e:
+                print(f"[RLM] Vercel callback failed: {e}")
+
             await alert_drew(
                 f"✅ Full Processing Complete!\n\n"
                 f"User: {user_id}\n"
