@@ -194,9 +194,18 @@ VERCEL_API_URL = os.getenv("VERCEL_API_URL")
 RLM_API_KEY = os.getenv("RLM_API_KEY")  # Shared secret for auth
 
 # Models - AWS Bedrock format
-HAIKU_MODEL = "us.anthropic.claude-3-5-haiku-20241022-v1:0"  # Fast, cheap for chunk analysis
-SONNET_MODEL = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"  # Smart for synthesis
-NOVA_LITE_MODEL = "amazon.nova-lite-v1:0"  # Amazon's model - much higher rate limits
+# Nova models have MUCH higher rate limits (~1000/min vs Claude's ~20/min)
+NOVA_MICRO_MODEL = "amazon.nova-micro-v1:0"  # Fast batch processing
+NOVA_LITE_MODEL = "amazon.nova-lite-v1:0"  # Chat, light tasks
+NOVA_PRO_MODEL = "amazon.nova-pro-v1:0"  # Synthesis merging
+NOVA_2_LITE_MODEL = "us.amazon.nova-2-lite-v1:0"  # Latest Nova with reasoning (1M context)
+
+# Claude models - use for QUALITY tasks (final output users see)
+HAIKU_MODEL = "us.anthropic.claude-3-5-haiku-20241022-v1:0"  # Legacy, keeping for fallback
+SONNET_MODEL = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"  # Legacy, keeping for fallback
+SONNET_4_5_MODEL = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"  # Best quality for SoulPrint files
+HAIKU_4_5_MODEL = "us.anthropic.claude-haiku-4-5-20251001-v1:0"  # Fast quality alternative
+
 USE_BEDROCK_CLAUDE = True  # Use AWS Bedrock instead of Anthropic API
 
 
@@ -1155,10 +1164,10 @@ Return JSON:
 Be SPECIFIC. Quote actual text. Return valid JSON only."""
 
     try:
-        # Use Bedrock Claude
+        # Use Nova Micro for batch processing (much higher rate limits than Claude)
         text = await bedrock_claude_message(
             messages=[{"role": "user", "content": prompt}],
-            model=HAIKU_MODEL,
+            model=NOVA_MICRO_MODEL,  # Nova has ~1000 req/min vs Claude's ~20/min
             max_tokens=2048,
         )
 
@@ -1170,7 +1179,7 @@ Be SPECIFIC. Quote actual text. Return valid JSON only."""
 
         return json.loads(text.strip())
     except Exception as e:
-        print(f"[RLM] Haiku batch {batch_num} error: {e}")
+        print(f"[RLM] Nova batch {batch_num} error: {e}")
         return {"error": str(e), "batch": batch_num}
 
 
@@ -1208,10 +1217,10 @@ Deduplicate but preserve unique insights.
 Return JSON with same structure as input summaries, but merged."""
 
     try:
-        # Use Bedrock Claude
+        # Use Nova Pro for merging (higher rate limits than Claude)
         text = await bedrock_claude_message(
             messages=[{"role": "user", "content": prompt}],
-            model=SONNET_MODEL,
+            model=NOVA_PRO_MODEL,  # Nova Pro for synthesis merging
             max_tokens=4096,
         )
 
@@ -1275,10 +1284,10 @@ Return JSON:
 Make it DEEPLY PERSONAL and SPECIFIC."""
 
     try:
-        # Use Bedrock Claude
+        # Use Nova Pro for final synthesis (higher rate limits)
         text = await bedrock_claude_message(
             messages=[{"role": "user", "content": prompt}],
-            model=SONNET_MODEL,
+            model=NOVA_PRO_MODEL,  # Nova Pro for synthesis
             max_tokens=8192,
         )
 
@@ -1313,10 +1322,10 @@ Return JSON with: archetype, core_essence, voice, mind, heart, world, best_quote
 Be specific and quote actual text."""
 
     try:
-        # Use Bedrock Claude
+        # Use Nova Pro for internal processing
         text = await bedrock_claude_message(
             messages=[{"role": "user", "content": prompt}],
-            model=SONNET_MODEL,
+            model=NOVA_PRO_MODEL,  # Higher rate limits for processing
             max_tokens=4096,
         )
 
@@ -1331,7 +1340,9 @@ Be specific and quote actual text."""
 
 
 async def generate_soulprint_files(profile: dict, messages: List[dict], user_id: str) -> dict:
-    """Generate the four SoulPrint markdown files using Bedrock Claude"""
+    """Generate the four SoulPrint markdown files using Claude Sonnet 4.5 (best quality for user-facing content)"""
+
+    print("[RLM] Generating SoulPrint files with Claude Sonnet 4.5...")
 
     # SOUL.md - Core personality
     soul_prompt = f"""Based on this personality profile, create SOUL.md - a comprehensive guide to who this person IS.
@@ -1354,7 +1365,7 @@ Keep it under 2000 words."""
 
     soul_md = await bedrock_claude_message(
         messages=[{"role": "user", "content": soul_prompt}],
-        model=SONNET_MODEL,
+        model=SONNET_4_5_MODEL,  # Best quality for user-facing content
         max_tokens=4096,
     )
 
@@ -1376,7 +1387,7 @@ Keep it under 500 words. Be creative but grounded in their actual patterns."""
 
     identity_md = await bedrock_claude_message(
         messages=[{"role": "user", "content": identity_prompt}],
-        model=SONNET_MODEL,
+        model=SONNET_4_5_MODEL,  # Best quality for user-facing content
         max_tokens=1024,
     )
 
@@ -1398,7 +1409,7 @@ Keep it under 1000 words. Make rules actionable and specific."""
 
     agents_md = await bedrock_claude_message(
         messages=[{"role": "user", "content": agents_prompt}],
-        model=SONNET_MODEL,
+        model=SONNET_4_5_MODEL,  # Best quality for user-facing content
         max_tokens=2048,
     )
 
@@ -1421,7 +1432,7 @@ Keep it under 1000 words. Stick to facts from the analysis."""
 
     user_md = await bedrock_claude_message(
         messages=[{"role": "user", "content": user_prompt}],
-        model=SONNET_MODEL,
+        model=SONNET_4_5_MODEL,  # Best quality for user-facing content
         max_tokens=2048,
     )
 
@@ -1509,10 +1520,10 @@ Create a memory log in markdown format:
 Keep it concise but informative. This will help the AI remember context."""
 
     try:
-        # Use Bedrock Claude
+        # Use Nova Micro for memory log (fast, high rate limit)
         return await bedrock_claude_message(
             messages=[{"role": "user", "content": prompt}],
-            model=HAIKU_MODEL,
+            model=NOVA_MICRO_MODEL,  # Fast batch processing
             max_tokens=1024,
         )
     except Exception as e:
@@ -2240,10 +2251,10 @@ Based on these conversations, provide a JSON analysis with:
 
 Return ONLY valid JSON, no markdown."""
 
-            # Use Bedrock Claude
+            # Use Nova Pro for internal analysis
             analysis_text = await bedrock_claude_message(
                 messages=[{"role": "user", "content": analysis_prompt}],
-                model=SONNET_MODEL,
+                model=NOVA_PRO_MODEL,  # Higher rate limits
                 max_tokens=2048,
             )
 
