@@ -2331,20 +2331,39 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
                         print(f"[RLM] No embedding returned for chunk {chunk['id']}")
                         return False
 
-                    # PATCH and verify it worked
+                    # PATCH with return=representation to verify update happened
+                    patch_headers = {
+                        **headers,
+                        "Prefer": "return=representation",
+                    }
                     patch_resp = await client.patch(
                         f"{SUPABASE_URL}/rest/v1/conversation_chunks",
                         params={"id": f"eq.{chunk['id']}"},
-                        headers=headers,
+                        headers=patch_headers,
                         json={"embedding": embedding},
                     )
+
+                    # Check status AND that a row was actually returned
                     if patch_resp.status_code not in (200, 204):
                         print(f"[RLM] PATCH failed for {chunk['id']}: {patch_resp.status_code} - {patch_resp.text[:200]}")
                         return False
+
+                    # Verify row was actually updated (return=representation gives us the row)
+                    result = patch_resp.json() if patch_resp.text else []
+                    if not result:
+                        print(f"[RLM] PATCH returned empty - row {chunk['id']} may not exist or wasn't updated")
+                        print(f"[RLM] Response status: {patch_resp.status_code}, body: {patch_resp.text[:500] if patch_resp.text else 'empty'}")
+                        return False
+
                     return True
                 except Exception as e:
                     print(f"[RLM] Embed error for {chunk['id']}: {e}")
                 return False
+
+            # Log first few chunk IDs for debugging
+            if chunks_to_embed:
+                first_ids = [c.get("id", "NO_ID") for c in chunks_to_embed[:3]]
+                print(f"[RLM] First chunk IDs to embed: {first_ids}")
 
             # Process in parallel batches
             for batch_start in range(0, len(chunks_to_embed), PARALLEL_BATCH_SIZE):
@@ -2355,6 +2374,10 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
                 batch_successes = sum(results)
                 batch_failures = len(results) - batch_successes
                 embedded_count += batch_successes
+
+                # Log first batch results for debugging
+                if batch_start == 0:
+                    print(f"[RLM] First batch results: {results} ({batch_successes}/{len(batch)} succeeded)")
 
                 # Track consecutive failures
                 if batch_failures == len(results):
