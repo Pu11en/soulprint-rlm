@@ -1906,7 +1906,7 @@ async def process_full_background(user_id: str, conversations: Optional[List[dic
             all_chunks = []
             total_messages = 0
 
-            for idx, conv in enumerate(conversations[:500]):  # Limit to 500 conversations
+            for idx, conv in enumerate(conversations):  # Process ALL conversations
                 title = conv.get("title", "Untitled")
                 messages = conv.get("messages", [])
                 created_at = conv.get("createdAt") or conv.get("created_at") or datetime.utcnow().isoformat()
