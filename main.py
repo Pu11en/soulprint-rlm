@@ -572,7 +572,7 @@ async def search_memories(user_id: str, query: str, limit: int = 50) -> List[dic
                         "match_user_id": user_id,
                         "match_tier": tier,
                         "match_count": tier_limit,
-                        "match_threshold": 0.25,  # Lower threshold for better recall
+                        "match_threshold": 0.10,  # Very low threshold for better recall
                     },
                     timeout=30.0,
                 )
