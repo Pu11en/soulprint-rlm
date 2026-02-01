@@ -1932,11 +1932,7 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
 
                 conversations = download_resp.json()
                 print(f"[RLM] Downloaded {len(conversations)} conversations from storage")
-
-                # Clean up storage file after download
-                delete_url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{file_path}"
-                await client.delete(delete_url, headers=headers)
-                print(f"[RLM] Cleaned up storage file: {storage_path}")
+                # Keep raw JSON in storage for future memory upgrades
 
             if not conversations:
                 print(f"[RLM] No conversations provided, checking existing chunks...")
