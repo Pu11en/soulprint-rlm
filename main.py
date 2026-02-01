@@ -239,22 +239,108 @@ async def alert_drew(message: str):
 
 
 # ============================================================================
-# VECTOR SEARCH (Bedrock Titan + conversation_chunks)
+# HYBRID SEARCH (Vector + Keyword for precise memory retrieval)
 # ============================================================================
+
+def extract_keywords(query: str) -> List[str]:
+    """Extract important keywords from query for keyword search"""
+    # Remove common words, keep names/nouns/specifics
+    stop_words = {
+        'i', 'me', 'my', 'we', 'our', 'you', 'your', 'what', 'when', 'where',
+        'who', 'how', 'why', 'the', 'a', 'an', 'is', 'are', 'was', 'were',
+        'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did',
+        'will', 'would', 'could', 'should', 'may', 'might', 'must', 'shall',
+        'can', 'need', 'dare', 'ought', 'used', 'to', 'of', 'in', 'for',
+        'on', 'with', 'at', 'by', 'from', 'as', 'into', 'through', 'during',
+        'before', 'after', 'above', 'below', 'between', 'under', 'again',
+        'further', 'then', 'once', 'here', 'there', 'all', 'each', 'few',
+        'more', 'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only',
+        'own', 'same', 'so', 'than', 'too', 'very', 'just', 'and', 'but',
+        'if', 'or', 'because', 'until', 'while', 'about', 'against', 'any',
+        'both', 'that', 'this', 'these', 'those', 'am', 'tell', 'said', 'say',
+        'talk', 'talked', 'about', 'remember', 'mentioned', 'told', 'asked',
+    }
+
+    words = re.findall(r'\b\w+\b', query.lower())
+    keywords = [w for w in words if w not in stop_words and len(w) > 2]
+    return keywords[:5]  # Max 5 keywords
+
+
+async def keyword_search(user_id: str, keywords: List[str], limit: int = 20) -> List[dict]:
+    """Search chunks by keyword matching (catches exact names, dates, etc.)"""
+    if not keywords:
+        return []
+
+    try:
+        async with httpx.AsyncClient() as client:
+            headers = {
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            }
+
+            # Build ILIKE query for each keyword
+            # This catches exact matches that vector search might miss
+            all_results = []
+            seen_ids = set()
+
+            for keyword in keywords:
+                response = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/conversation_chunks",
+                    params={
+                        "user_id": f"eq.{user_id}",
+                        "content": f"ilike.*{keyword}*",
+                        "select": "id,content,title,chunk_tier,message_count,created_at",
+                        "limit": str(limit // len(keywords) + 1),
+                    },
+                    headers=headers,
+                    timeout=15.0,
+                )
+
+                if response.status_code == 200:
+                    results = response.json()
+                    for r in results:
+                        if r['id'] not in seen_ids:
+                            r['match_type'] = 'keyword'
+                            r['matched_keyword'] = keyword
+                            all_results.append(r)
+                            seen_ids.add(r['id'])
+
+            print(f"[RLM] Keyword search found {len(all_results)} matches for: {keywords}")
+            return all_results[:limit]
+
+    except Exception as e:
+        print(f"[RLM] Keyword search error: {e}")
+        return []
+
 
 async def search_memories(user_id: str, query: str, limit: int = 50) -> List[dict]:
     """
-    Search conversation_chunks by vector similarity using Bedrock Titan embeddings.
-    Uses tier-aware search: macro (themes) → medium (context) → micro (facts)
+    HYBRID SEARCH: Vector similarity + Keyword matching with RRF (Reciprocal Rank Fusion).
+
+    Uses Supabase-recommended hybrid search pattern:
+    1. Extract keywords from query (names, specific terms)
+    2. Run keyword search (catches exact matches like names, dates)
+    3. Run tier-aware vector search (catches semantic matches)
+    4. Merge using RRF: score = 1/(k + rank) from each method
+    5. Return deduplicated, ranked results
+
+    RRF ensures both precise keyword matches AND semantically similar content surface.
     """
+
+    # Extract keywords for exact matching
+    keywords = extract_keywords(query)
+    print(f"[RLM] Hybrid search - query: '{query[:50]}...', keywords: {keywords}")
+
+    # Run keyword search first (catches exact names, dates, etc.)
+    keyword_results = await keyword_search(user_id, keywords, limit=30)
 
     # Generate query embedding with Bedrock Titan
     query_embedding = await embed_text_bedrock(query)
     if not query_embedding:
-        print("[RLM] Failed to generate query embedding, using fallback")
-        return await get_recent_chunks(user_id, limit)
+        print("[RLM] Failed to generate query embedding, using keyword results only")
+        return keyword_results if keyword_results else await get_recent_chunks(user_id, limit)
 
-    all_memories = []
+    vector_results = []
 
     try:
         async with httpx.AsyncClient() as client:
@@ -264,14 +350,14 @@ async def search_memories(user_id: str, query: str, limit: int = 50) -> List[dic
                 "Content-Type": "application/json",
             }
 
-            # Search each tier with different limits
+            # Tier-aware vector search
             # Macro: themes/relationships (few, high context)
             # Medium: conversation context (moderate)
             # Micro: precise facts (many, pinpoint accuracy)
             tier_limits = [
-                ("macro", 10),   # Broad themes
-                ("medium", 20),  # Conversation context
-                ("micro", 20),   # Precise facts
+                ("macro", 15),   # Broad themes
+                ("medium", 25),  # Conversation context
+                ("micro", 25),   # Precise facts
             ]
 
             for tier, tier_limit in tier_limits:
@@ -283,7 +369,7 @@ async def search_memories(user_id: str, query: str, limit: int = 50) -> List[dic
                         "match_user_id": user_id,
                         "match_tier": tier,
                         "match_count": tier_limit,
-                        "match_threshold": 0.3,
+                        "match_threshold": 0.25,  # Lower threshold for better recall
                     },
                     timeout=30.0,
                 )
@@ -291,12 +377,13 @@ async def search_memories(user_id: str, query: str, limit: int = 50) -> List[dic
                 if response.status_code == 200:
                     tier_results = response.json()
                     for r in tier_results:
-                        r["chunk_tier"] = tier  # Tag with tier
-                    all_memories.extend(tier_results)
-                    print(f"[RLM] Tier '{tier}' returned {len(tier_results)} matches")
+                        r["chunk_tier"] = tier
+                        r["match_type"] = "vector"
+                    vector_results.extend(tier_results)
+                    print(f"[RLM] Vector tier '{tier}' returned {len(tier_results)} matches")
 
-            # Fallback to non-tier search if no results or function doesn't exist
-            if not all_memories:
+            # Fallback to non-tier search if no results
+            if not vector_results:
                 response = await client.post(
                     f"{SUPABASE_URL}/rest/v1/rpc/match_conversation_chunks",
                     headers=headers,
@@ -304,18 +391,87 @@ async def search_memories(user_id: str, query: str, limit: int = 50) -> List[dic
                         "query_embedding": query_embedding,
                         "match_user_id": user_id,
                         "match_count": limit,
-                        "match_threshold": 0.3,
+                        "match_threshold": 0.25,
                     },
                     timeout=30.0,
                 )
                 if response.status_code == 200:
-                    all_memories = response.json()
+                    vector_results = response.json()
+                    for r in vector_results:
+                        r["match_type"] = "vector"
 
-            print(f"[RLM] Total memories retrieved: {len(all_memories)}")
-            return all_memories[:limit]
+            # ============================================================
+            # RRF (Reciprocal Rank Fusion) - Supabase recommended approach
+            # Formula: score = 1/(k + rank)
+            # k=60 is smoothing constant (prevents top results from dominating)
+            # ============================================================
+            RRF_K = 60
+            KEYWORD_WEIGHT = 1.5  # Boost keyword matches (exact is important)
+            SEMANTIC_WEIGHT = 1.0
+
+            # Build score map by chunk ID
+            chunk_scores = {}  # id -> {score, data}
+
+            # Score keyword results (rank 1 = best match)
+            for rank, result in enumerate(keyword_results):
+                chunk_id = result.get('id')
+                if not chunk_id:
+                    continue
+                rrf_score = KEYWORD_WEIGHT * (1.0 / (RRF_K + rank + 1))
+                if chunk_id in chunk_scores:
+                    chunk_scores[chunk_id]['score'] += rrf_score
+                    chunk_scores[chunk_id]['data']['match_type'] = 'hybrid'  # Found in both
+                else:
+                    chunk_scores[chunk_id] = {
+                        'score': rrf_score,
+                        'data': {**result, 'match_type': 'keyword'}
+                    }
+
+            # Score vector results
+            for rank, result in enumerate(vector_results):
+                chunk_id = result.get('id')
+                if not chunk_id:
+                    continue
+                rrf_score = SEMANTIC_WEIGHT * (1.0 / (RRF_K + rank + 1))
+                if chunk_id in chunk_scores:
+                    chunk_scores[chunk_id]['score'] += rrf_score
+                    # If already keyword, now it's hybrid
+                    if chunk_scores[chunk_id]['data'].get('match_type') == 'keyword':
+                        chunk_scores[chunk_id]['data']['match_type'] = 'hybrid'
+                else:
+                    chunk_scores[chunk_id] = {
+                        'score': rrf_score,
+                        'data': {**result}
+                    }
+
+            # Sort by RRF score (highest first) and return
+            sorted_results = sorted(
+                chunk_scores.values(),
+                key=lambda x: x['score'],
+                reverse=True
+            )
+
+            # Add RRF score to each result for debugging
+            final_results = []
+            for item in sorted_results[:limit]:
+                result = item['data']
+                result['rrf_score'] = round(item['score'], 4)
+                final_results.append(result)
+
+            # Log match type distribution
+            hybrid_count = sum(1 for r in final_results if r.get('match_type') == 'hybrid')
+            keyword_only = sum(1 for r in final_results if r.get('match_type') == 'keyword')
+            vector_only = sum(1 for r in final_results if r.get('match_type') == 'vector')
+            print(f"[RLM] Hybrid search results: {len(final_results)} total "
+                  f"(hybrid={hybrid_count}, keyword={keyword_only}, vector={vector_only})")
+
+            return final_results
 
     except Exception as e:
         print(f"[RLM] Vector search exception: {e}")
+        # Fallback: return keyword results if vector failed
+        if keyword_results:
+            return keyword_results
         return await get_recent_chunks(user_id, limit)
 
 
@@ -394,16 +550,27 @@ async def chat(request: ChatRequest):
         # Get SoulPrint
         soulprint = await get_soulprint(request.user_id)
 
-        # Build memory context
+        # Build memory context with hybrid search results
         memory_context = ""
         if memories:
             memory_context = "## Relevant Memories from Past Conversations\n\n"
-            for i, mem in enumerate(memories[:20]):
-                title = mem.get('conversation_title', 'Unknown')
-                content = mem.get('content', '')[:500]
-                timestamp = mem.get('original_timestamp', '')
-                similarity = mem.get('similarity', 0)
-                memory_context += f"**[{title}]** (relevance: {similarity:.2f})\n{content}\n\n"
+            for i, mem in enumerate(memories[:25]):  # Use more memories
+                title = mem.get('title', mem.get('conversation_title', 'Unknown'))
+                content = mem.get('content', '')[:600]
+                match_type = mem.get('match_type', 'unknown')
+                rrf_score = mem.get('rrf_score', 0)
+                tier = mem.get('chunk_tier', '')
+
+                # Show match source for context
+                match_indicator = ""
+                if match_type == 'hybrid':
+                    match_indicator = "🎯"  # Found by both keyword AND semantic
+                elif match_type == 'keyword':
+                    match_indicator = "📌"  # Exact keyword match
+                else:
+                    match_indicator = "💭"  # Semantic match
+
+                memory_context += f"**{match_indicator} [{title}]** ({tier}, score: {rrf_score})\n{content}\n\n"
 
         # Build SoulPrint context
         soul_context = ""
