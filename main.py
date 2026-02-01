@@ -162,10 +162,10 @@ async def embed_text_bedrock(text: str, bedrock_client=None) -> Optional[List[fl
         # Truncate to max input size (Titan limit is ~8k tokens, ~32k chars safe)
         text = text[:8000]
 
-        # Titan Embed v2 request format
-        # Note: dimensions and normalize are optional, try without them first
+        # Titan Embed v2 request format - use default 1024 dimensions
         request_body = json.dumps({
-            "inputText": text
+            "inputText": text,
+            "normalize": True
         })
 
         print(f"[RLM] Calling Bedrock model: {BEDROCK_EMBEDDING_MODEL_ID}, text length: {len(text)}")
