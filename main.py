@@ -513,12 +513,15 @@ async def process_import_background(user_id: str, user_email: Optional[str], con
                 "Content-Type": "application/json",
             }
 
-            # Update progress
-            await client.patch(
+            # Upsert user_profile (create if doesn't exist)
+            await client.post(
                 f"{SUPABASE_URL}/rest/v1/user_profiles",
-                params={"user_id": f"eq.{user_id}"},
-                headers=headers,
-                json={"total_messages": total_messages},
+                headers={**headers, "Prefer": "resolution=merge-duplicates"},
+                json={
+                    "user_id": user_id,
+                    "total_messages": total_messages,
+                    "import_status": "processing",
+                },
             )
 
             # Skip embeddings for now - we'll do synthesis directly
@@ -553,8 +556,9 @@ async def process_import_background(user_id: str, user_email: Optional[str], con
 {json.dumps(soulprint_result.get('world', {}), indent=2)}
 """
 
-            # Update user_profiles with SoulPrint data
+            # Upsert user_profiles with SoulPrint data
             profile_payload = {
+                "user_id": user_id,
                 "import_status": "complete",
                 "soulprint": soulprint_result,  # Full JSON
                 "soulprint_text": soulprint_text,  # Readable version
@@ -563,10 +567,9 @@ async def process_import_background(user_id: str, user_email: Optional[str], con
                 "soulprint_generated_at": datetime.utcnow().isoformat(),
             }
 
-            await client.patch(
+            await client.post(
                 f"{SUPABASE_URL}/rest/v1/user_profiles",
-                params={"user_id": f"eq.{user_id}"},
-                headers=headers,
+                headers={**headers, "Prefer": "resolution=merge-duplicates"},
                 json=profile_payload,
             )
 
