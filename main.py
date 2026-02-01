@@ -189,8 +189,8 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 BEDROCK_EMBEDDING_MODEL_ID = os.getenv("BEDROCK_EMBEDDING_MODEL_ID", "amazon.titan-embed-text-v2:0")
 
-# Vercel callback
-VERCEL_API_URL = os.getenv("VERCEL_API_URL")
+# Vercel callback - hardcoded since it's not sensitive and simplifies deployment
+VERCEL_API_URL = os.getenv("VERCEL_API_URL", "https://www.soulprintengine.ai")
 RLM_API_KEY = os.getenv("RLM_API_KEY")  # Shared secret for auth
 
 # Models - AWS Bedrock format
@@ -2793,7 +2793,8 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
             )
 
             # Send email NOW - user can start chatting
-            vercel_url = os.environ.get("VERCEL_API_URL", "https://www.soulprintengine.ai")
+            vercel_url = VERCEL_API_URL
+            print(f"[RLM] 📧 Sending email notification via {vercel_url}/api/import/complete")
             try:
                 callback_resp = await client.post(
                     f"{vercel_url}/api/import/complete",
@@ -2807,11 +2808,12 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
                     timeout=30.0,
                 )
                 if callback_resp.status_code == 200:
-                    print(f"[RLM] ✅ Email sent - user can chat now! ({soulprint_time:.1f}s)")
+                    resp_data = callback_resp.json()
+                    print(f"[RLM] ✅ Email callback success! email_sent={resp_data.get('email_sent')}, push_sent={resp_data.get('push_sent')}")
                 else:
-                    print(f"[RLM] Vercel callback returned {callback_resp.status_code}")
+                    print(f"[RLM] ⚠️ Vercel callback returned {callback_resp.status_code}: {callback_resp.text[:200]}")
             except Exception as e:
-                print(f"[RLM] Vercel callback failed: {e}")
+                print(f"[RLM] ❌ Vercel callback failed: {e}")
 
             await alert_drew(
                 f"🚀 User Can Chat Now!\n\n"
@@ -3299,7 +3301,7 @@ async def generate_soulprint_endpoint(user_id: str):
             )
 
             # Trigger completion callback
-            vercel_url = os.environ.get("VERCEL_API_URL", "https://www.soulprintengine.ai")
+            vercel_url = VERCEL_API_URL
             try:
                 callback_resp = await client.post(
                     f"{vercel_url}/api/import/complete",
