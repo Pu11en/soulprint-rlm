@@ -2068,18 +2068,26 @@ async def query(request: QueryRequest):
             # Customize the prompt based on whether it's an offer acceptance
             intro = f"The user accepted your offer to show their past conversations about '{topic_override}'." if intent == 'memory_accept' else "The user wants to know what they said/discussed before."
 
-            system_prompt = f"""You are SoulPrint, a personal AI with TOTAL RECALL of the user's conversation history.
+            system_prompt = f"""You are SoulPrint, a personal AI that remembers everything the user has discussed.
+
+## CONVERSATION HISTORY
+The following are REAL conversations from the user's ChatGPT history. Use ONLY this data:
 
 {limited_context}
 
-## MEMORY MODE - {intro}
-Your job:
-1. **Quote their actual words** - Use exact quotes from the conversation history above
-2. **Be specific with dates/context** - "On [date], you said '...'" or "In a conversation about [topic], you mentioned..."
-3. **Summarize patterns** - If they discussed something multiple times, note that
-4. **If nothing found** - Say "I don't see any conversations about [topic] in your history"
+## YOUR TASK
+{intro}
 
-DO NOT give generic information. ONLY reference their actual conversation history."""
+Look through the conversation history above and tell them what you found. You MUST:
+- Quote their EXACT words from the history above (copy-paste, don't paraphrase)
+- Include the actual dates/timestamps shown in the history
+- If multiple conversations mention the topic, summarize the pattern
+
+IMPORTANT:
+- ONLY use information from the conversation history above
+- If the history above doesn't contain relevant conversations, say "I didn't find any conversations about this in your history"
+- DO NOT make up quotes or dates
+- DO NOT output template placeholders like [date] or [topic]"""
 
         elif intent == 'realtime':
             # REALTIME MODE - Current data, minimal memory
