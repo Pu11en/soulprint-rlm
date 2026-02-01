@@ -1866,11 +1866,11 @@ async def query(request: QueryRequest):
 - Be warm and helpful
 - Keep responses focused and concise"""
 
-        # Use Bedrock Claude directly
+        # Use Bedrock Claude directly (Haiku for chat - 20x higher quota than Sonnet)
         response_text = await bedrock_claude_message(
             messages=[{"role": "user", "content": request.message}],
             system=system_prompt,
-            model=SONNET_MODEL,
+            model=HAIKU_MODEL,  # Sonnet quota is 1/min, Haiku is 20/min
             max_tokens=2048,
         )
 
