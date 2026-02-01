@@ -1964,9 +1964,46 @@ async def test_patch():
                 )
 
 
+def detect_query_intent(message: str) -> str:
+    """
+    Smart routing - detect what kind of response the user wants:
+    - 'memory': User explicitly asking about their past/history
+    - 'realtime': User asking about current events, prices, news
+    - 'normal': General question - answer directly, offer memory if relevant
+    """
+    msg_lower = message.lower()
+
+    # MEMORY MODE - user explicitly asking about their past
+    memory_triggers = [
+        'what did i say', 'what have i said', 'did i mention', 'did i talk about',
+        'in the past', 'in my history', 'remember when', 'do you remember',
+        'what i said about', 'my thoughts on', 'my opinion on',
+        'what do i think about', 'what did i think', 'have i ever',
+        'tell me about me', 'what do you know about me',
+        'my past conversations', 'from our conversations',
+        'based on what i said', 'according to my history',
+    ]
+    if any(trigger in msg_lower for trigger in memory_triggers):
+        return 'memory'
+
+    # REALTIME MODE - user asking about current/live data
+    realtime_triggers = [
+        'price of', 'stock price', 'crypto price', 'bitcoin price',
+        'weather', 'forecast', 'temperature',
+        'latest news', 'current news', 'today\'s', 'right now',
+        'happening now', 'live', 'real-time', 'realtime',
+        'score', 'game score', 'who won',
+    ]
+    if any(trigger in msg_lower for trigger in realtime_triggers):
+        return 'realtime'
+
+    # Default to normal mode
+    return 'normal'
+
+
 @app.post("/query", response_model=QueryResponse)
 async def query(request: QueryRequest):
-    """Main query endpoint - TRUE RLM with vector similarity search"""
+    """Main query endpoint with SMART ROUTING"""
     start = time.time()
 
     if not RLM_AVAILABLE:
@@ -1977,47 +2014,99 @@ async def query(request: QueryRequest):
         )
 
     try:
-        # Use hybrid search (tier-aware vector + keyword)
-        chunks = await search_memories(request.user_id, request.message, limit=30)
+        # SMART ROUTING - detect what the user wants
+        intent = detect_query_intent(request.message)
+        print(f"[RLM] Query intent: {intent} | Message: '{request.message[:50]}...'")
 
-        # Get soulprint separately
+        # Get soulprint for personality context (always useful)
         soulprint_data = await get_soulprint(request.user_id)
         soulprint = request.soulprint_text or (soulprint_data.get('soulprint_text') if soulprint_data else None)
 
-        context = build_context(chunks, soulprint, request.history or [])
+        chunks = []
+        memory_offer = ""
 
-        limited_context = context[:20000] if len(context) > 20000 else context
+        if intent == 'memory':
+            # MEMORY MODE - Deep dive into their history
+            chunks = await search_memories(request.user_id, request.message, limit=50)
+            context = build_context(chunks, soulprint, request.history or [])
+            limited_context = context[:25000] if len(context) > 25000 else context
 
-        system_prompt = f"""You are SoulPrint, a personal AI with TOTAL RECALL of the user's conversation history.
+            system_prompt = f"""You are SoulPrint, a personal AI with TOTAL RECALL of the user's conversation history.
 
 {limited_context}
 
-## CRITICAL INSTRUCTIONS - MUST FOLLOW
-1. **ALWAYS cite specific memories** - When answering, quote or reference the ACTUAL content from "Relevant Conversation History" above
-2. **Use their exact words** - Say things like "You mentioned on [date]..." or "In a past conversation, you said '...'"
-3. **Be specific, not generic** - NEVER give generic information. Always ground responses in THEIR actual history
-4. **If no relevant memory exists** - Say "I don't see that in our past conversations" rather than making things up
+## MEMORY MODE - User is asking about their past
+The user wants to know what they said/discussed before. Your job:
+1. **Quote their actual words** - Use exact quotes from the conversation history above
+2. **Be specific with dates/context** - "On [date], you said '...'" or "In a conversation about [topic], you mentioned..."
+3. **Summarize patterns** - If they discussed something multiple times, note that
+4. **If nothing found** - Say "I don't see any conversations about [topic] in your history"
 
-## Response Style
-- Start by acknowledging what you found in their history
-- Quote their own words back to them when relevant
-- Be warm and personal - you KNOW them from these conversations
-- Keep responses focused but show you actually read the memories"""
+DO NOT give generic information. ONLY reference their actual conversation history."""
 
-        # Use Amazon Nova Lite for chat - much higher rate limits than Claude
+        elif intent == 'realtime':
+            # REALTIME MODE - Current data, minimal memory
+            # Check if web_search_context was passed
+            web_context = request.web_search_context if hasattr(request, 'web_search_context') and request.web_search_context else ""
+
+            system_prompt = f"""You are SoulPrint, a personal AI assistant.
+
+## User Profile
+{soulprint if soulprint else 'No profile loaded'}
+
+{f'## Real-time Information{chr(10)}{web_context}' if web_context else '## Note: No real-time data available. Answer based on your knowledge but note if info might be outdated.'}
+
+## REALTIME MODE
+The user is asking about current/live information.
+- If real-time data is provided above, use it and cite sources
+- If no real-time data, answer but mention your knowledge cutoff
+- Keep response focused on their specific question"""
+
+        else:
+            # NORMAL MODE - Answer directly, then offer memory check
+            # Do a quick memory search to see if there's relevant history
+            chunks = await search_memories(request.user_id, request.message, limit=10)
+
+            # Extract topic for the memory offer
+            topic_words = [w for w in request.message.split() if len(w) > 3 and w.lower() not in ['what', 'how', 'when', 'where', 'does', 'this', 'that', 'about', 'with']]
+            topic = ' '.join(topic_words[:3]) if topic_words else 'this topic'
+
+            if chunks and len(chunks) >= 3:
+                memory_offer = f"\n\n💭 *I found {len(chunks)} past conversations about {topic} - want me to show you what you said before?*"
+
+            system_prompt = f"""You are SoulPrint, a knowledgeable personal AI assistant.
+
+## User Profile
+{soulprint if soulprint else 'No profile loaded'}
+
+## NORMAL MODE - Direct Answer
+The user is asking a general question. Your job:
+1. **Answer their question directly** - Give a clear, helpful response
+2. **Be knowledgeable** - Use your training to provide accurate info
+3. **Be personal** - Use their profile to tailor the response style
+4. **Keep it concise** - Don't over-explain unless asked
+
+Answer the question naturally without forcing references to past conversations."""
+
+        # Generate response
         response_text = await bedrock_claude_message(
             messages=[{"role": "user", "content": request.message}],
             system=system_prompt,
-            model=NOVA_LITE_MODEL,  # Amazon's model - ~1000 req/min vs Claude's 20/min
+            model=NOVA_LITE_MODEL,
             max_tokens=2048,
         )
 
+        # Add memory offer for normal mode if relevant history exists
+        if intent == 'normal' and memory_offer:
+            response_text += memory_offer
+
         latency = int((time.time() - start) * 1000)
+        print(f"[RLM] Response generated in {latency}ms | Intent: {intent} | Chunks: {len(chunks)}")
 
         return QueryResponse(
             response=response_text,
             chunks_used=len(chunks),
-            method="rlm-bedrock" if (BEDROCK_AVAILABLE and AWS_ACCESS_KEY_ID) else "rlm-cohere",
+            method=f"rlm-{intent}",
             latency_ms=latency,
         )
 
