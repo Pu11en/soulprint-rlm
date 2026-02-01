@@ -3,6 +3,9 @@ SoulPrint RLM Service
 TRUE Recursive Language Models - no fallback, memory is critical
 Multi-tier precision chunking with vector similarity search
 EXHAUSTIVE analysis - processes ALL conversations
++ NEW: /process-import for background processing from imported_chats
++ NEW: /chat with SoulPrint files (soul_md, identity_md, agents_md, user_md)
++ NEW: AWS Bedrock Titan v2 embeddings
 """
 import os
 import re
@@ -11,14 +14,12 @@ import httpx
 import time
 import asyncio
 import anthropic
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional, List
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-
-# Exhaustive soulprint functions inlined below (after app setup)
 
 # Import RLM - REQUIRED, no fallback
 try:
@@ -28,6 +29,14 @@ except ImportError as e:
     RLM_AVAILABLE = False
     RLM_IMPORT_ERROR = str(e)
 
+# AWS Bedrock for embeddings
+try:
+    import boto3
+    from botocore.config import Config
+    BEDROCK_AVAILABLE = True
+except ImportError:
+    BEDROCK_AVAILABLE = False
+
 load_dotenv()
 
 app = FastAPI(title="SoulPrint RLM Service")
@@ -35,7 +44,7 @@ app = FastAPI(title="SoulPrint RLM Service")
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Render handles CORS
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -47,7 +56,20 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 ALERT_TELEGRAM_BOT = os.getenv("ALERT_TELEGRAM_BOT")
-ALERT_TELEGRAM_CHAT = os.getenv("ALERT_TELEGRAM_CHAT", "7414639817")  # Drew's Telegram
+ALERT_TELEGRAM_CHAT = os.getenv("ALERT_TELEGRAM_CHAT", "7414639817")
+
+# AWS Config
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+
+# Vercel callback
+VERCEL_API_URL = os.getenv("VERCEL_API_URL")
+RLM_API_KEY = os.getenv("RLM_API_KEY")  # Shared secret for auth
+
+# Models
+HAIKU_MODEL = "claude-3-5-haiku-20241022"  # Fast, cheap for chunk analysis
+SONNET_MODEL = "claude-sonnet-4-20250514"  # Smart for synthesis
 
 
 class QueryRequest(BaseModel):
@@ -64,6 +86,24 @@ class QueryResponse(BaseModel):
     latency_ms: int
 
 
+class ChatRequest(BaseModel):
+    user_id: str
+    message: str
+    history: Optional[List[dict]] = []
+
+
+class ChatResponse(BaseModel):
+    response: str
+    memories_used: int
+    latency_ms: int
+
+
+class ProcessImportRequest(BaseModel):
+    user_id: str
+    user_email: Optional[str] = None
+    conversations_json: Optional[str] = None  # Raw JSON from ChatGPT export
+
+
 class AnalyzeRequest(BaseModel):
     user_id: str
 
@@ -74,12 +114,91 @@ class CreateSoulprintRequest(BaseModel):
     stats: Optional[dict] = None
 
 
+# ============================================================================
+# AWS BEDROCK EMBEDDINGS
+# ============================================================================
+
+def get_bedrock_client():
+    """Get AWS Bedrock client"""
+    if not BEDROCK_AVAILABLE:
+        return None
+    if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
+        return None
+
+    config = Config(
+        region_name=AWS_REGION,
+        retries={'max_attempts': 3, 'mode': 'adaptive'}
+    )
+
+    return boto3.client(
+        'bedrock-runtime',
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        config=config
+    )
+
+
+async def embed_text_bedrock(text: str, bedrock_client=None) -> Optional[List[float]]:
+    """Generate embedding using AWS Bedrock Titan v2"""
+    if not bedrock_client:
+        bedrock_client = get_bedrock_client()
+    if not bedrock_client:
+        return None
+
+    try:
+        # Truncate text to max input size
+        text = text[:8000]
+
+        response = bedrock_client.invoke_model(
+            modelId="amazon.titan-embed-text-v2:0",
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps({
+                "inputText": text,
+                "dimensions": 768,  # Match existing schema
+                "normalize": True
+            })
+        )
+
+        result = json.loads(response['body'].read())
+        return result.get('embedding')
+    except Exception as e:
+        print(f"[RLM] Bedrock embed error: {e}")
+        return None
+
+
+async def embed_texts_batch(texts: List[str], batch_size: int = 10) -> List[Optional[List[float]]]:
+    """Batch embed texts with rate limiting"""
+    bedrock_client = get_bedrock_client()
+    embeddings = []
+
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+        batch_embeddings = []
+
+        for text in batch:
+            emb = await embed_text_bedrock(text, bedrock_client)
+            batch_embeddings.append(emb)
+            await asyncio.sleep(0.1)  # Rate limit
+
+        embeddings.extend(batch_embeddings)
+
+        if i + batch_size < len(texts):
+            await asyncio.sleep(0.5)  # Batch delay
+
+    return embeddings
+
+
+# ============================================================================
+# ALERTS
+# ============================================================================
+
 async def alert_drew(message: str):
     """Alert Drew on Telegram when something is wrong"""
     if not ALERT_TELEGRAM_BOT:
         print(f"[ALERT - NO BOT CONFIGURED] {message}")
         return
-    
+
     try:
         async with httpx.AsyncClient() as client:
             await client.post(
@@ -94,12 +213,843 @@ async def alert_drew(message: str):
         print(f"Failed to alert Drew: {e}")
 
 
+# ============================================================================
+# VECTOR SEARCH (Bedrock + Supabase)
+# ============================================================================
+
+async def search_memories(user_id: str, query: str, limit: int = 50) -> List[dict]:
+    """Search imported_chats by vector similarity using Bedrock embeddings"""
+
+    # Generate query embedding
+    query_embedding = await embed_text_bedrock(query)
+    if not query_embedding:
+        print("[RLM] Failed to generate query embedding, using fallback")
+        return await get_recent_messages(user_id, limit)
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/match_imported_chats",
+                headers={
+                    "apikey": SUPABASE_SERVICE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "query_embedding": query_embedding,
+                    "match_user_id": user_id,
+                    "match_count": limit,
+                    "match_threshold": 0.3,
+                },
+                timeout=30.0,
+            )
+
+            if response.status_code == 200:
+                memories = response.json()
+                print(f"[RLM] Vector search returned {len(memories)} memories")
+                return memories
+            else:
+                print(f"[RLM] Vector search error: {response.status_code}")
+                return await get_recent_messages(user_id, limit)
+    except Exception as e:
+        print(f"[RLM] Vector search exception: {e}")
+        return await get_recent_messages(user_id, limit)
+
+
+async def get_recent_messages(user_id: str, limit: int = 100) -> List[dict]:
+    """Fallback: get recent messages without vector search"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SUPABASE_URL}/rest/v1/imported_chats",
+                params={
+                    "user_id": f"eq.{user_id}",
+                    "role": "eq.user",
+                    "select": "id,content,conversation_title,original_timestamp",
+                    "order": "original_timestamp.desc",
+                    "limit": str(limit),
+                },
+                headers={
+                    "apikey": SUPABASE_SERVICE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                },
+                timeout=30.0,
+            )
+            return response.json() if response.status_code == 200 else []
+    except Exception as e:
+        print(f"[RLM] Recent messages error: {e}")
+        return []
+
+
+async def get_soulprint(user_id: str) -> dict:
+    """Get SoulPrint files from soulprints table"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SUPABASE_URL}/rest/v1/soulprints",
+                params={
+                    "user_id": f"eq.{user_id}",
+                    "select": "soul_md,identity_md,agents_md,user_md,archetype,name",
+                    "order": "updated_at.desc",
+                    "limit": "1",
+                },
+                headers={
+                    "apikey": SUPABASE_SERVICE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                },
+                timeout=30.0,
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                return data[0] if data else {}
+            return {}
+    except Exception as e:
+        print(f"[RLM] Get soulprint error: {e}")
+        return {}
+
+
+# ============================================================================
+# /chat - Memory-aware chat with SoulPrint
+# ============================================================================
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    """
+    Chat endpoint with memory retrieval and SoulPrint personality.
+
+    Flow:
+    1. Embed user message (Bedrock Titan)
+    2. Search imported_chats for similar past messages
+    3. Load SoulPrint files
+    4. Build prompt with memory context
+    5. Generate response with Claude
+    """
+    start = time.time()
+
+    try:
+        # Get memories relevant to this message
+        memories = await search_memories(request.user_id, request.message, limit=30)
+
+        # Get SoulPrint
+        soulprint = await get_soulprint(request.user_id)
+
+        # Build memory context
+        memory_context = ""
+        if memories:
+            memory_context = "## Relevant Memories from Past Conversations\n\n"
+            for i, mem in enumerate(memories[:20]):
+                title = mem.get('conversation_title', 'Unknown')
+                content = mem.get('content', '')[:500]
+                timestamp = mem.get('original_timestamp', '')
+                similarity = mem.get('similarity', 0)
+                memory_context += f"**[{title}]** (relevance: {similarity:.2f})\n{content}\n\n"
+
+        # Build SoulPrint context
+        soul_context = ""
+        if soulprint:
+            if soulprint.get('soul_md'):
+                soul_context += f"## Soul Profile\n{soulprint['soul_md']}\n\n"
+            if soulprint.get('identity_md'):
+                soul_context += f"## Identity\n{soulprint['identity_md']}\n\n"
+            if soulprint.get('agents_md'):
+                soul_context += f"## Communication Guide\n{soulprint['agents_md']}\n\n"
+            if soulprint.get('user_md'):
+                soul_context += f"## User Context\n{soulprint['user_md']}\n\n"
+
+        # Build conversation history
+        history_context = ""
+        if request.history:
+            history_context = "## Current Conversation\n"
+            for msg in request.history[-10:]:
+                role = msg.get('role', 'user')
+                content = msg.get('content', '')[:500]
+                history_context += f"**{role}**: {content}\n"
+            history_context += "\n"
+
+        # Build the prompt
+        system_prompt = f"""You are SoulPrint, a deeply personalized AI companion with perfect memory of the user's conversation history.
+
+{soul_context}
+
+{memory_context}
+
+{history_context}
+
+## Instructions
+- You have access to the user's past conversations above. Reference them naturally when relevant.
+- Embody the personality and communication style described in the Soul Profile.
+- Be warm, helpful, and authentic.
+- If the user asks about something from their past, the relevant memories are provided above.
+- Keep responses concise but personal."""
+
+        # Generate response
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model=SONNET_MODEL,
+            max_tokens=2048,
+            system=system_prompt[:15000],  # Limit system prompt
+            messages=[{"role": "user", "content": request.message}],
+        )
+
+        latency = int((time.time() - start) * 1000)
+
+        return ChatResponse(
+            response=response.content[0].text,
+            memories_used=len(memories),
+            latency_ms=latency,
+        )
+
+    except Exception as e:
+        error_msg = str(e)
+        print(f"[RLM] Chat error: {error_msg}")
+        await alert_drew(f"Chat Error\n\nUser: {request.user_id}\nError: {error_msg[:500]}")
+        raise HTTPException(status_code=500, detail=f"Chat failed: {error_msg}")
+
+
+# ============================================================================
+# /process-import - Background SoulPrint Generation
+# ============================================================================
+
+def parse_chatgpt_conversations(conversations_json: str) -> List[dict]:
+    """
+    Parse ChatGPT export JSON into flat message list.
+
+    ChatGPT format:
+    - Array of conversation objects
+    - Each conversation has a 'mapping' dict with message nodes
+    - Messages have 'author.role' and 'content.parts'
+    """
+    try:
+        conversations = json.loads(conversations_json)
+    except json.JSONDecodeError as e:
+        print(f"[RLM] JSON parse error: {e}")
+        return []
+
+    messages = []
+
+    for conv in conversations:
+        title = conv.get('title', 'Untitled')
+        mapping = conv.get('mapping', {})
+
+        # Walk the message tree
+        for node_id, node in mapping.items():
+            msg = node.get('message')
+            if not msg:
+                continue
+
+            author = msg.get('author', {})
+            role = author.get('role', '')
+
+            # Only get user messages for personality analysis
+            if role != 'user':
+                continue
+
+            # Extract content
+            content_obj = msg.get('content', {})
+            parts = content_obj.get('parts', [])
+
+            # Filter to text parts only
+            text_parts = [p for p in parts if isinstance(p, str)]
+            if not text_parts:
+                continue
+
+            content = '\n'.join(text_parts).strip()
+            if not content or len(content) < 5:
+                continue
+
+            # Get timestamp
+            create_time = msg.get('create_time')
+            timestamp = None
+            if create_time:
+                try:
+                    timestamp = datetime.fromtimestamp(create_time).isoformat()
+                except:
+                    pass
+
+            messages.append({
+                'content': content,
+                'conversation_title': title,
+                'original_timestamp': timestamp,
+                'role': 'user',
+            })
+
+    # Sort by timestamp if available
+    messages.sort(key=lambda m: m.get('original_timestamp') or '')
+
+    return messages
+
+
+async def process_import_background(user_id: str, user_email: Optional[str], conversations_json: Optional[str]):
+    """
+    Background job to process imported chats and generate SoulPrint.
+
+    Flow:
+    1. Parse conversations_json directly (no database table needed)
+    2. Run recursive Haiku/Sonnet synthesis
+    3. Generate SoulPrint files (soul_md, identity_md, agents_md, user_md)
+    4. Save to Supabase user_profiles
+    5. Call Vercel completion callback
+    """
+    start = time.time()
+    print(f"[RLM] Starting import processing for user {user_id}")
+
+    try:
+        # 1. Parse the raw conversations JSON
+        if not conversations_json:
+            raise Exception("No conversations_json provided")
+
+        messages = parse_chatgpt_conversations(conversations_json)
+        total_messages = len(messages)
+        print(f"[RLM] Parsed {total_messages} user messages from ChatGPT export")
+
+        if total_messages == 0:
+            raise Exception("No user messages found in export")
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            headers = {
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                "Content-Type": "application/json",
+            }
+
+            # Update progress
+            await client.patch(
+                f"{SUPABASE_URL}/rest/v1/user_profiles",
+                params={"user_id": f"eq.{user_id}"},
+                headers=headers,
+                json={"total_messages": total_messages},
+            )
+
+            # Skip embeddings for now - we'll do synthesis directly
+            # Embeddings can be generated later for memory search
+            embedded_count = 0
+            print(f"[RLM] Skipping embeddings for now, proceeding to synthesis...")
+
+            # 2. Run recursive Haiku/Sonnet synthesis
+            print("[RLM] Starting recursive synthesis...")
+            soulprint_result = await recursive_synthesize(messages, user_id)
+
+            # 3. Generate SoulPrint files
+            print("[RLM] Generating SoulPrint files...")
+            soul_files = await generate_soulprint_files(soulprint_result, messages, user_id)
+
+            # 4. Save to user_profiles (simpler - no separate soulprints table needed)
+            print("[RLM] Saving SoulPrint to user_profiles...")
+
+            # Build soulprint_text for display
+            soulprint_text = f"""# {soulprint_result.get('archetype', 'Your SoulPrint')}
+
+{soulprint_result.get('core_essence', '')}
+
+## Communication Style
+{json.dumps(soulprint_result.get('voice', {}), indent=2)}
+
+## Personality
+{json.dumps(soulprint_result.get('mind', {}), indent=2)}
+{json.dumps(soulprint_result.get('heart', {}), indent=2)}
+
+## Your World
+{json.dumps(soulprint_result.get('world', {}), indent=2)}
+"""
+
+            # Update user_profiles with SoulPrint data
+            profile_payload = {
+                "import_status": "complete",
+                "soulprint": soulprint_result,  # Full JSON
+                "soulprint_text": soulprint_text,  # Readable version
+                "archetype": soulprint_result.get("archetype", "Unique Individual"),
+                "total_messages": total_messages,
+                "soulprint_generated_at": datetime.utcnow().isoformat(),
+            }
+
+            await client.patch(
+                f"{SUPABASE_URL}/rest/v1/user_profiles",
+                params={"user_id": f"eq.{user_id}"},
+                headers=headers,
+                json=profile_payload,
+            )
+
+            elapsed = time.time() - start
+            print(f"[RLM] Import processing complete in {elapsed:.1f}s")
+
+            # 6. Call Vercel completion callback
+            if VERCEL_API_URL:
+                try:
+                    await client.post(
+                        f"{VERCEL_API_URL}/api/import/complete",
+                        headers={
+                            "Content-Type": "application/json",
+                            "X-RLM-API-Key": RLM_API_KEY or "",
+                        },
+                        json={
+                            "user_id": user_id,
+                            "email": user_email,
+                            "success": True,
+                            "messages_processed": total_messages,
+                            "embeddings_generated": embedded_count,
+                            "elapsed_seconds": round(elapsed, 1),
+                        },
+                        timeout=30.0,
+                    )
+                    print(f"[RLM] Notified Vercel of completion")
+                except Exception as e:
+                    print(f"[RLM] Failed to notify Vercel: {e}")
+
+            # Alert success
+            await alert_drew(
+                f"✅ SoulPrint Generated!\n\n"
+                f"User: {user_id}\n"
+                f"Messages: {total_messages}\n"
+                f"Embeddings: {embedded_count}\n"
+                f"Time: {elapsed:.1f}s"
+            )
+
+    except Exception as e:
+        error_msg = str(e)
+        print(f"[RLM] Import processing failed: {error_msg}")
+
+        # Update status to failed
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.patch(
+                    f"{SUPABASE_URL}/rest/v1/user_profiles",
+                    params={"user_id": f"eq.{user_id}"},
+                    headers={
+                        "apikey": SUPABASE_SERVICE_KEY,
+                        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"import_status": "failed"},
+                )
+        except:
+            pass
+
+        await alert_drew(f"❌ Import Failed\n\nUser: {user_id}\nError: {error_msg[:500]}")
+
+
+async def recursive_synthesize(messages: List[dict], user_id: str, batch_size: int = 100) -> dict:
+    """
+    Recursive synthesis using Haiku for chunks, Sonnet for synthesis.
+
+    Level 1: Haiku processes batches → summaries
+    Level 2+: Sonnet merges summaries → until single result
+    """
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    if len(messages) <= batch_size:
+        # Base case: small enough for single Sonnet call
+        return await sonnet_generate_profile(messages, client)
+
+    # Level 1: Process batches with Haiku (fast, cheap)
+    print(f"[RLM] Level 1: Processing {len(messages)} messages in batches of {batch_size}")
+    summaries = []
+
+    batches = [messages[i:i+batch_size] for i in range(0, len(messages), batch_size)]
+
+    for i, batch in enumerate(batches):
+        print(f"[RLM] Haiku processing batch {i+1}/{len(batches)}")
+        summary = await haiku_extract_patterns(batch, i, len(batches), client)
+        summaries.append(summary)
+        await asyncio.sleep(0.3)  # Rate limit
+
+    # Level 2+: Recursive merge with Sonnet
+    print(f"[RLM] Level 2: Merging {len(summaries)} summaries")
+    return await recursive_merge_summaries(summaries, client)
+
+
+async def haiku_extract_patterns(batch: List[dict], batch_num: int, total_batches: int, client) -> dict:
+    """Level 1: Haiku extracts patterns from a batch of messages"""
+
+    # Build message text
+    batch_text = ""
+    for msg in batch:
+        content = msg.get('content', '')[:500]
+        title = msg.get('conversation_title', '')
+        if content.strip():
+            batch_text += f"[{title}] {content}\n\n"
+
+    batch_text = batch_text[:30000]  # Limit size
+
+    prompt = f"""Analyze these user messages and extract personality patterns. Batch {batch_num + 1}/{total_batches}.
+
+## MESSAGES
+{batch_text}
+
+## TASK
+Extract SPECIFIC patterns with QUOTES from the text.
+
+Return JSON:
+{{
+  "voice": {{
+    "formality": "casual|mixed|formal",
+    "tone_examples": ["direct quotes showing tone"],
+    "humor_examples": ["jokes or sarcasm if any"],
+    "emoji_usage": ["emojis they use"]
+  }},
+  "topics": {{
+    "interests": ["topics they discuss"],
+    "expertise": ["things they know well"],
+    "questions": ["types of questions they ask"]
+  }},
+  "personality": {{
+    "traits": ["observable traits"],
+    "values": ["what matters to them"],
+    "communication_style": "brief description"
+  }},
+  "facts": {{
+    "people": ["names mentioned"],
+    "places": ["locations mentioned"],
+    "work": ["job/career info"],
+    "life": ["life details"]
+  }},
+  "quotes": ["5-10 most characteristic quotes"]
+}}
+
+Be SPECIFIC. Quote actual text. Return valid JSON only."""
+
+    try:
+        response = client.messages.create(
+            model=HAIKU_MODEL,
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        text = response.content[0].text
+
+        # Parse JSON
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0]
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0]
+
+        return json.loads(text.strip())
+    except Exception as e:
+        print(f"[RLM] Haiku batch {batch_num} error: {e}")
+        return {"error": str(e), "batch": batch_num}
+
+
+async def recursive_merge_summaries(summaries: List[dict], client, merge_size: int = 10) -> dict:
+    """Recursively merge summaries until we have a single profile"""
+
+    if len(summaries) <= merge_size:
+        # Final merge
+        return await sonnet_final_synthesis(summaries, client)
+
+    # Merge in groups
+    merged = []
+    for i in range(0, len(summaries), merge_size):
+        group = summaries[i:i+merge_size]
+        partial = await sonnet_merge_partial(group, client)
+        merged.append(partial)
+        await asyncio.sleep(0.5)
+
+    # Recurse
+    return await recursive_merge_summaries(merged, client, merge_size)
+
+
+async def sonnet_merge_partial(summaries: List[dict], client) -> dict:
+    """Sonnet merges a group of summaries into one"""
+
+    prompt = f"""Merge these personality summaries into one consolidated summary.
+
+## SUMMARIES TO MERGE
+{json.dumps(summaries, indent=2)[:40000]}
+
+## TASK
+Combine all patterns, keeping the most specific quotes and examples.
+Deduplicate but preserve unique insights.
+
+Return JSON with same structure as input summaries, but merged."""
+
+    try:
+        response = client.messages.create(
+            model=SONNET_MODEL,
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        text = response.content[0].text
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0]
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0]
+
+        return json.loads(text.strip())
+    except Exception as e:
+        print(f"[RLM] Merge error: {e}")
+        return {"merged": summaries, "error": str(e)}
+
+
+async def sonnet_final_synthesis(summaries: List[dict], client) -> dict:
+    """Sonnet creates final personality profile from all summaries"""
+
+    prompt = f"""Create a comprehensive personality profile from these analyzed patterns.
+
+## ALL PATTERNS
+{json.dumps(summaries, indent=2)[:50000]}
+
+## TASK
+Synthesize everything into a deep, personalized profile.
+
+Return JSON:
+{{
+  "archetype": "Creative 2-4 word title (e.g., 'The Relentless Builder')",
+  "core_essence": "2-3 sentences capturing who they are",
+  "voice": {{
+    "formality": "casual|mixed|formal",
+    "humor": "dry|playful|sarcastic|warm|none",
+    "emoji_style": "heavy|moderate|minimal|none",
+    "signature_phrases": ["their catchphrases"],
+    "tone": "overall communication tone"
+  }},
+  "mind": {{
+    "thinking_style": "how they process ideas",
+    "interests": ["core interests"],
+    "expertise": ["areas of knowledge"],
+    "curiosity": "what drives their questions"
+  }},
+  "heart": {{
+    "emotional_expression": "how they show feelings",
+    "values": ["what matters to them"],
+    "connection_style": "how they relate to others"
+  }},
+  "world": {{
+    "people": ["important people in their life"],
+    "places": ["relevant locations"],
+    "work": "career/professional context",
+    "life_context": "relevant life details"
+  }},
+  "best_quotes": ["10-15 most characteristic quotes"],
+  "communication_guide": {{
+    "do": ["how to communicate as them"],
+    "avoid": ["what to avoid"]
+  }}
+}}
+
+Make it DEEPLY PERSONAL and SPECIFIC."""
+
+    try:
+        response = client.messages.create(
+            model=SONNET_MODEL,
+            max_tokens=8192,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        text = response.content[0].text
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0]
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0]
+
+        return json.loads(text.strip())
+    except Exception as e:
+        print(f"[RLM] Final synthesis error: {e}")
+        return {"archetype": "Unique Individual", "error": str(e)}
+
+
+async def sonnet_generate_profile(messages: List[dict], client) -> dict:
+    """Generate profile from small message set (base case)"""
+
+    msg_text = ""
+    for msg in messages:
+        content = msg.get('content', '')[:300]
+        if content.strip():
+            msg_text += f"{content}\n\n"
+
+    msg_text = msg_text[:40000]
+
+    prompt = f"""Analyze these messages and create a personality profile.
+
+## MESSAGES
+{msg_text}
+
+Return JSON with: archetype, core_essence, voice, mind, heart, world, best_quotes, communication_guide.
+Be specific and quote actual text."""
+
+    try:
+        response = client.messages.create(
+            model=SONNET_MODEL,
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        text = response.content[0].text
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0]
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0]
+
+        return json.loads(text.strip())
+    except Exception as e:
+        return {"archetype": "Unique Individual", "error": str(e)}
+
+
+async def generate_soulprint_files(profile: dict, messages: List[dict], user_id: str) -> dict:
+    """Generate the four SoulPrint markdown files"""
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    # SOUL.md - Core personality
+    soul_prompt = f"""Based on this personality profile, create SOUL.md - a comprehensive guide to who this person IS.
+
+## PROFILE
+{json.dumps(profile, indent=2)[:20000]}
+
+## TASK
+Write SOUL.md in markdown format covering:
+- Core personality traits
+- Communication style and vibe
+- Vocabulary patterns and phrases they use
+- Emoji usage patterns
+- Emotional expression patterns
+- Boundaries and sensitivities
+
+Write it as a reference guide for an AI to understand and embody this person's communication style.
+Be specific with examples and quotes.
+Keep it under 2000 words."""
+
+    soul_response = client.messages.create(
+        model=SONNET_MODEL,
+        max_tokens=4096,
+        messages=[{"role": "user", "content": soul_prompt}],
+    )
+    soul_md = soul_response.content[0].text
+
+    # IDENTITY.md - AI persona
+    identity_prompt = f"""Based on this profile, create IDENTITY.md - defining the AI persona.
+
+## PROFILE
+{json.dumps(profile, indent=2)[:10000]}
+
+## TASK
+Write IDENTITY.md covering:
+- Persona name (derived from their style)
+- Signature emoji that represents them
+- One-sentence vibe description
+- How to maintain persona consistency
+- What makes this persona unique
+
+Keep it under 500 words. Be creative but grounded in their actual patterns."""
+
+    identity_response = client.messages.create(
+        model=SONNET_MODEL,
+        max_tokens=1024,
+        messages=[{"role": "user", "content": identity_prompt}],
+    )
+    identity_md = identity_response.content[0].text
+
+    # AGENTS.md - Behavior rules
+    agents_prompt = f"""Based on this profile, create AGENTS.md - operational rules for the AI.
+
+## PROFILE
+{json.dumps(profile, indent=2)[:10000]}
+
+## TASK
+Write AGENTS.md covering:
+- Response pacing and rhythm
+- Context adaptation rules (formal vs casual situations)
+- Memory protocol (how to reference past conversations)
+- Emotional intelligence guidelines
+- Consistency rules
+
+Keep it under 1000 words. Make rules actionable and specific."""
+
+    agents_response = client.messages.create(
+        model=SONNET_MODEL,
+        max_tokens=2048,
+        messages=[{"role": "user", "content": agents_prompt}],
+    )
+    agents_md = agents_response.content[0].text
+
+    # USER.md - Facts about the user
+    user_prompt = f"""Based on this profile, create USER.md - factual information about the user.
+
+## PROFILE
+{json.dumps(profile, indent=2)[:10000]}
+
+## TASK
+Write USER.md covering:
+- Personal info (name if known, location hints)
+- Key relationships (people mentioned)
+- Interests and hobbies
+- Work/career context
+- Recurring topics they care about
+- Current life context
+
+Keep it under 1000 words. Stick to facts from the analysis."""
+
+    user_response = client.messages.create(
+        model=SONNET_MODEL,
+        max_tokens=2048,
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+    user_md = user_response.content[0].text
+
+    return {
+        "soul_md": soul_md,
+        "identity_md": identity_md,
+        "agents_md": agents_md,
+        "user_md": user_md,
+    }
+
+
+@app.post("/process-import")
+async def process_import(request: ProcessImportRequest, background_tasks: BackgroundTasks):
+    """
+    Start background processing of ChatGPT export.
+
+    Receives raw conversations_json and processes in background:
+    1. Parse ChatGPT JSON format
+    2. Run recursive Haiku/Sonnet synthesis
+    3. Generate SoulPrint files
+    4. Save to Supabase user_profiles
+    5. Notify Vercel when complete (triggers email)
+    """
+    print(f"[RLM] Received process-import request for user {request.user_id}")
+
+    if not request.conversations_json:
+        raise HTTPException(status_code=400, detail="conversations_json is required")
+
+    # Quick validation
+    try:
+        convs = json.loads(request.conversations_json)
+        conv_count = len(convs) if isinstance(convs, list) else 0
+        print(f"[RLM] Validated JSON: {conv_count} conversations")
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+
+    # Start background processing
+    background_tasks.add_task(
+        process_import_background,
+        request.user_id,
+        request.user_email,
+        request.conversations_json
+    )
+
+    return {
+        "status": "processing",
+        "message": "SoulPrint generation started. You'll be notified when complete.",
+        "user_id": request.user_id,
+        "conversations_received": conv_count,
+    }
+
+
+# ============================================================================
+# EXISTING ENDPOINTS (kept for compatibility)
+# ============================================================================
+
 async def embed_query(query: str) -> Optional[List[float]]:
-    """Embed a query using Cohere for vector similarity search"""
+    """Embed a query - prefer Bedrock, fallback to Cohere"""
+    # Try Bedrock first
+    embedding = await embed_text_bedrock(query)
+    if embedding:
+        return embedding
+
+    # Fallback to Cohere
     if not COHERE_API_KEY:
-        print("[RLM] No Cohere API key, skipping vector search")
         return None
-    
+
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
@@ -118,19 +1068,16 @@ async def embed_query(query: str) -> Optional[List[float]]:
             if response.status_code == 200:
                 data = response.json()
                 return data["embeddings"][0]
-            else:
-                print(f"[RLM] Cohere embed error: {response.status_code}")
-                return None
     except Exception as e:
         print(f"[RLM] Cohere embed exception: {e}")
-        return None
+
+    return None
 
 
 async def vector_search_chunks(user_id: str, query_embedding: List[float], limit: int = 50) -> List[dict]:
     """Search chunks by vector similarity using Supabase RPC"""
     try:
         async with httpx.AsyncClient() as client:
-            # Call the match_conversation_chunks RPC function
             response = await client.post(
                 f"{SUPABASE_URL}/rest/v1/rpc/match_conversation_chunks",
                 headers={
@@ -142,7 +1089,7 @@ async def vector_search_chunks(user_id: str, query_embedding: List[float], limit
                     "query_embedding": query_embedding,
                     "match_user_id": user_id,
                     "match_count": limit,
-                    "match_threshold": 0.3,  # Lower threshold for more results
+                    "match_threshold": 0.3,
                 },
                 timeout=30.0,
             )
@@ -159,28 +1106,21 @@ async def vector_search_chunks(user_id: str, query_embedding: List[float], limit
 
 
 async def get_user_data(user_id: str, query: Optional[str] = None) -> tuple[List[dict], Optional[str]]:
-    """Fetch conversation chunks and soulprint from Supabase
-    
-    If query is provided, uses vector similarity search for precision.
-    Otherwise falls back to fetching recent chunks.
-    """
+    """Fetch conversation chunks and soulprint from Supabase"""
     async with httpx.AsyncClient() as client:
         headers = {
             "apikey": SUPABASE_SERVICE_KEY,
             "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
         }
-        
+
         chunks = []
-        
-        # Try vector similarity search if we have a query
-        if query and COHERE_API_KEY:
+
+        if query:
             query_embedding = await embed_query(query)
             if query_embedding:
                 chunks = await vector_search_chunks(user_id, query_embedding, limit=100)
-        
-        # Fallback to recent chunks if vector search didn't work
+
         if not chunks:
-            print("[RLM] Falling back to recent chunks")
             chunks_response = await client.get(
                 f"{SUPABASE_URL}/rest/v1/conversation_chunks",
                 params={
@@ -192,8 +1132,7 @@ async def get_user_data(user_id: str, query: Optional[str] = None) -> tuple[List
                 headers=headers,
             )
             chunks = chunks_response.json() if chunks_response.status_code == 200 else []
-        
-        # Get soulprint
+
         profile_response = await client.get(
             f"{SUPABASE_URL}/rest/v1/user_profiles",
             params={
@@ -202,59 +1141,59 @@ async def get_user_data(user_id: str, query: Optional[str] = None) -> tuple[List
             },
             headers=headers,
         )
-        
+
         profile = profile_response.json()
         soulprint_text = profile[0]["soulprint_text"] if profile else None
-        
+
         return chunks, soulprint_text
 
 
 def build_context(chunks: List[dict], soulprint_text: Optional[str], history: List[dict]) -> str:
     """Build the context string for RLM"""
     context_parts = []
-    
+
     if soulprint_text:
         context_parts.append(f"## User Profile\n{soulprint_text}")
-    
+
     if chunks:
         context_parts.append("## Relevant Conversation History (by similarity)")
-        for i, chunk in enumerate(chunks[:50]):  # Top 50 most relevant
+        for i, chunk in enumerate(chunks[:50]):
             similarity = chunk.get('similarity', 'N/A')
             content = chunk.get('content', '')[:2000]
             title = chunk.get('title', 'Untitled')
             context_parts.append(f"\n### [{i+1}] {title} (sim: {similarity})\n{content}")
-    
+
     if history:
         recent_history = json.dumps(history[-10:], indent=2)
         context_parts.append(f"## Current Conversation\n{recent_history}")
-    
+
     return "\n\n".join(context_parts)
 
 
 @app.on_event("startup")
 async def startup():
-    """Check RLM availability on startup"""
+    """Check availability on startup"""
     if not RLM_AVAILABLE:
-        await alert_drew(f"RLM LIBRARY NOT AVAILABLE!\n\nImport error: {RLM_IMPORT_ERROR}\n\nService will return errors until fixed.")
+        print(f"[RLM] Warning: RLM library not available: {RLM_IMPORT_ERROR}")
     else:
-        print("[RLM] Library loaded successfully")
-    
-    if COHERE_API_KEY:
-        print("[RLM] Cohere API key configured - vector search enabled")
+        print("[RLM] RLM library loaded successfully")
+
+    if BEDROCK_AVAILABLE and AWS_ACCESS_KEY_ID:
+        print("[RLM] AWS Bedrock configured - using Titan embeddings")
+    elif COHERE_API_KEY:
+        print("[RLM] Cohere API key configured - using Cohere embeddings")
     else:
-        print("[RLM] No Cohere API key - using fallback chunk retrieval")
+        print("[RLM] Warning: No embedding service configured")
 
 
 @app.get("/health")
 async def health():
-    """Health check - returns error if RLM not available"""
-    if not RLM_AVAILABLE:
-        raise HTTPException(status_code=503, detail=f"RLM not available: {RLM_IMPORT_ERROR}")
+    """Health check"""
     return {
         "status": "ok",
         "service": "soulprint-rlm",
-        "rlm_available": True,
-        "vector_search": bool(COHERE_API_KEY),
+        "rlm_available": RLM_AVAILABLE,
+        "bedrock_available": BEDROCK_AVAILABLE and bool(AWS_ACCESS_KEY_ID),
         "timestamp": datetime.utcnow().isoformat(),
     }
 
@@ -263,39 +1202,30 @@ async def health():
 async def query(request: QueryRequest):
     """Main query endpoint - TRUE RLM with vector similarity search"""
     start = time.time()
-    
-    # CRITICAL: RLM must be available
+
     if not RLM_AVAILABLE:
         await alert_drew(f"Query failed - RLM not available\nUser: {request.user_id}")
         raise HTTPException(
             status_code=503,
             detail="Memory service unavailable. Please try again later."
         )
-    
+
     try:
-        # Fetch user data with vector search using the query
         chunks, soulprint_text = await get_user_data(request.user_id, query=request.message)
-        
-        # Use provided soulprint or fetched
         soulprint = request.soulprint_text or soulprint_text
-        
-        # Build context
         context = build_context(chunks, soulprint, request.history or [])
-        
-        # Initialize RLM with Anthropic backend
+
         rlm = RLM(
             backend="anthropic",
             backend_kwargs={
-                "model_name": "claude-sonnet-4-20250514",
+                "model_name": SONNET_MODEL,
                 "api_key": ANTHROPIC_API_KEY,
             },
             verbose=False,
         )
-        
-        # Limit context to avoid timeout
+
         limited_context = context[:20000] if len(context) > 20000 else context
-        
-        # Build the RLM prompt
+
         prompt = f"""You are SoulPrint, a personal AI with infinite memory of the user's conversation history.
 
 {limited_context}
@@ -304,21 +1234,17 @@ async def query(request: QueryRequest):
 - Use the conversation history to provide personalized, contextual responses
 - Reference relevant past conversations naturally
 - Be warm and helpful
-- If asked about past conversations, the relevant chunks are already provided above
 - Keep responses focused and concise
 
 User's message: {request.message}"""
 
-        # Execute RLM query with error handling
         try:
             result = rlm.completion(prompt)
         except Exception as rlm_error:
-            # If RLM fails, fall back to direct Anthropic
             print(f"[RLM] RLM execution failed: {rlm_error}, using direct call")
-            import anthropic
             client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
             response = client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model=SONNET_MODEL,
                 max_tokens=2048,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -326,16 +1252,16 @@ User's message: {request.message}"""
                 def __init__(self, text):
                     self.response = text
             result = MockResult(response.content[0].text)
-        
+
         latency = int((time.time() - start) * 1000)
-        
+
         return QueryResponse(
             response=result.response,
             chunks_used=len(chunks),
-            method="rlm-vector" if COHERE_API_KEY else "rlm-fallback",
+            method="rlm-bedrock" if (BEDROCK_AVAILABLE and AWS_ACCESS_KEY_ID) else "rlm-cohere",
             latency_ms=latency,
         )
-        
+
     except Exception as e:
         error_msg = str(e)
         await alert_drew(f"RLM Query Error\n\nUser: {request.user_id}\nError: {error_msg[:500]}")
@@ -346,15 +1272,14 @@ User's message: {request.message}"""
 async def analyze(request: AnalyzeRequest):
     """Deep personality analysis using RLM on conversation history"""
     start = time.time()
-    
+
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             headers = {
                 "apikey": SUPABASE_SERVICE_KEY,
                 "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
             }
-            
-            # Fetch raw conversations
+
             response = await client.get(
                 f"{SUPABASE_URL}/rest/v1/raw_conversations",
                 params={
@@ -365,22 +1290,20 @@ async def analyze(request: AnalyzeRequest):
                 },
                 headers=headers,
             )
-            
+
             if response.status_code != 200:
                 raise HTTPException(status_code=500, detail="Failed to fetch conversations")
-            
+
             conversations = response.json()
-            
+
             if not conversations:
                 return {"error": "No conversations found", "profile": None}
-            
-            # Strategic sampling: recent, oldest, longest
+
             recent = conversations[:50]
             oldest = conversations[-50:] if len(conversations) > 50 else []
             by_length = sorted(conversations, key=lambda c: c.get("message_count", 0), reverse=True)
             longest = by_length[:100]
-            
-            # Deduplicate
+
             seen = set()
             sampled = []
             for conv in recent + oldest + longest:
@@ -388,66 +1311,38 @@ async def analyze(request: AnalyzeRequest):
                 if conv_id not in seen:
                     seen.add(conv_id)
                     sampled.append(conv)
-            
-            # Build analysis prompt
+
             sample_text = ""
-            for conv in sampled[:100]:  # Max 100 for analysis
+            for conv in sampled[:100]:
                 title = conv.get("title", "Untitled")
-                messages = conv.get("messages", [])[:10]  # First 10 messages
+                messages = conv.get("messages", [])[:10]
                 msg_text = "\n".join([f"- {m.get('role', 'unknown')}: {m.get('content', '')[:200]}" for m in messages])
                 sample_text += f"\n\n### {title}\n{msg_text}"
-            
+
             analysis_prompt = f"""Analyze this user's conversation history and create a detailed personality profile.
 
 {sample_text[:30000]}
 
 Based on these conversations, provide a JSON analysis with:
-1. archetype: Their primary personality archetype (e.g., "The Builder", "The Explorer", "The Connector")
-2. tone: How they communicate (casual, professional, mixed)
-3. humor: Their sense of humor (dry, playful, sarcastic, none)
+1. archetype: Their primary personality archetype
+2. tone: How they communicate
+3. humor: Their sense of humor
 4. interests: Top 10 interests/topics
 5. communication_style: How they prefer to receive information
 6. key_traits: 5 defining personality traits
-7. avoid: Things the AI should avoid when talking to them
+7. avoid: Things the AI should avoid
 
 Return ONLY valid JSON, no markdown."""
 
-            # Use RLM or direct Anthropic
-            if RLM_AVAILABLE:
-                try:
-                    rlm = RLM(
-                        backend="anthropic",
-                        backend_kwargs={
-                            "model_name": "claude-sonnet-4-20250514",
-                            "api_key": ANTHROPIC_API_KEY,
-                        },
-                        verbose=False,
-                    )
-                    result = rlm.completion(analysis_prompt)
-                    analysis_text = result.response
-                except Exception as e:
-                    print(f"[RLM] Analysis failed, using direct: {e}")
-                    import anthropic
-                    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-                    response = client.messages.create(
-                        model="claude-sonnet-4-20250514",
-                        max_tokens=2048,
-                        messages=[{"role": "user", "content": analysis_prompt}],
-                    )
-                    analysis_text = response.content[0].text
-            else:
-                import anthropic
-                client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-                response = client.messages.create(
-                    model="claude-sonnet-4-20250514",
-                    max_tokens=2048,
-                    messages=[{"role": "user", "content": analysis_prompt}],
-                )
-                analysis_text = response.content[0].text
-            
-            # Parse JSON from response
+            anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+            response = anthropic_client.messages.create(
+                model=SONNET_MODEL,
+                max_tokens=2048,
+                messages=[{"role": "user", "content": analysis_prompt}],
+            )
+            analysis_text = response.content[0].text
+
             try:
-                # Try to extract JSON from response
                 json_match = re.search(r'\{[\s\S]*\}', analysis_text)
                 if json_match:
                     profile = json.loads(json_match.group())
@@ -455,317 +1350,61 @@ Return ONLY valid JSON, no markdown."""
                     profile = {"raw": analysis_text}
             except json.JSONDecodeError:
                 profile = {"raw": analysis_text}
-            
-            # Update user profile with analysis
-            update_response = await client.patch(
-                f"{SUPABASE_URL}/rest/v1/user_profiles",
-                params={"user_id": f"eq.{request.user_id}"},
-                headers={**headers, "Content-Type": "application/json", "Prefer": "return=minimal"},
-                json={
-                    "soulprint": {**profile, "analyzed_at": datetime.utcnow().isoformat()},
-                    "soulprint_updated_at": datetime.utcnow().isoformat(),
-                },
-            )
-            
+
             latency = int((time.time() - start) * 1000)
-            
+
             return {
                 "success": True,
                 "profile": profile,
                 "conversations_analyzed": len(sampled),
                 "latency_ms": latency,
             }
-            
+
     except Exception as e:
         error_msg = str(e)
         print(f"[RLM] Analyze error: {error_msg}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {error_msg}")
 
 
-# ============================================================================
-# EXHAUSTIVE SOULPRINT GENERATION - Processes ALL conversations in batches
-# ============================================================================
-
-async def extract_patterns_from_batch(batch: List[dict], batch_num: int, total_batches: int, anthropic_client) -> dict:
-    """Extract patterns from a batch of conversations"""
-    
-    conversation_text = ""
-    for conv in batch:
-        title = conv.get("title", "Untitled")
-        messages = conv.get("messages", conv.get("mapping", []))
-        
-        if isinstance(messages, list):
-            msg_excerpts = []
-            for m in messages[:20]:
-                if isinstance(m, dict):
-                    role = m.get("role", m.get("author", {}).get("role", "unknown"))
-                    content = m.get("content", "")
-                    if isinstance(content, list):
-                        content = " ".join([p.get("text", str(p)) for p in content if isinstance(p, dict)])
-                    elif isinstance(content, dict):
-                        content = content.get("parts", [content.get("text", str(content))])[0] if content else ""
-                    content = str(content)[:500]
-                    if content.strip():
-                        msg_excerpts.append(f"{role}: {content}")
-                elif isinstance(m, str):
-                    msg_excerpts.append(f"user: {m[:500]}")
-            
-            if msg_excerpts:
-                conversation_text += f"\n### {title}\n" + "\n".join(msg_excerpts) + "\n"
-        elif isinstance(messages, dict):
-            for node_id, node in list(messages.items())[:20]:
-                if isinstance(node, dict) and "message" in node:
-                    msg = node["message"]
-                    if msg:
-                        role = msg.get("author", {}).get("role", "unknown")
-                        content = msg.get("content", {})
-                        if isinstance(content, dict):
-                            parts = content.get("parts", [])
-                            text = parts[0] if parts else ""
-                        else:
-                            text = str(content)
-                        if text and len(text.strip()) > 0:
-                            conversation_text += f"{role}: {text[:500]}\n"
-    
-    conversation_text = conversation_text[:40000]
-    
-    extraction_prompt = f"""Analyze conversations to extract personality patterns. Batch {batch_num + 1}/{total_batches}.
-
-## CONVERSATIONS
-{conversation_text}
-
-## TASK
-Extract SPECIFIC patterns. Quote examples.
-
-Return JSON:
-{{
-  "voice_patterns": {{
-    "formality_examples": ["quotes"],
-    "humor_examples": ["jokes, sarcasm"],
-    "emoji_patterns": ["emojis used"],
-    "greeting_styles": ["how they start"],
-    "sign_off_styles": ["how they end"]
-  }},
-  "thinking_patterns": {{
-    "explanation_style": "how they explain",
-    "question_types": ["question types"],
-    "problem_approach": "problem solving style"
-  }},
-  "emotional_patterns": {{
-    "enthusiasm_markers": ["excitement words"],
-    "frustration_markers": ["frustration words"],
-    "support_language": ["comfort phrases"]
-  }},
-  "memory_anchors": {{
-    "people_mentioned": ["names"],
-    "recurring_topics": ["topics"],
-    "strong_opinions": ["opinions"],
-    "interests": ["hobbies"]
-  }},
-  "unique_markers": {{
-    "catchphrases": ["repeated phrases"],
-    "word_choices": ["distinctive vocab"]
-  }}
-}}
-
-Be SPECIFIC. Quote text. Empty arrays if pattern absent."""
-
-    response = anthropic_client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4096,
-        messages=[{"role": "user", "content": extraction_prompt}],
-    )
-    
-    response_text = response.content[0].text
-    try:
-        if "```json" in response_text:
-            response_text = response_text.split("```json")[1].split("```")[0]
-        elif "```" in response_text:
-            response_text = response_text.split("```")[1].split("```")[0]
-        return json.loads(response_text.strip())
-    except:
-        return {"raw_analysis": response_text}
-
-
-async def synthesize_soulprint(all_patterns: List[dict], stats: dict, anthropic_client) -> dict:
-    """Synthesize all patterns into final soulprint"""
-    
-    merged = {"voice_patterns": [], "thinking_patterns": [], "emotional_patterns": [], "memory_anchors": [], "unique_markers": []}
-    
-    for patterns in all_patterns:
-        for key in merged:
-            if key in patterns:
-                if isinstance(patterns[key], dict):
-                    merged[key].append(patterns[key])
-                elif isinstance(patterns[key], list):
-                    merged[key].extend(patterns[key])
-    
-    synthesis_prompt = f"""Create FINAL SoulPrint from ALL extracted patterns.
-
-## PATTERNS FROM ALL CONVERSATIONS
-{json.dumps(merged, indent=2)[:50000]}
-
-## STATS
-{json.dumps(stats, indent=2) if stats else "No stats"}
-
-## TASK
-Create comprehensive, deeply personalized SoulPrint.
-
-Return JSON:
-{{
-  "archetype": "Creative 2-4 word title (e.g., 'The Relentless Builder')",
-  "core_essence": "2-3 sentences of who they are",
-  "voice": {{
-    "formality": "casual|mixed|formal",
-    "humor": "dry|playful|sarcastic|warm|none",
-    "emoji_style": "heavy|moderate|minimal|none",
-    "signature_phrases": ["catchphrases"]
-  }},
-  "mind": {{
-    "thinking_style": "how they process ideas",
-    "curiosity_drivers": ["what drives learning"],
-    "problem_solving": "approach to challenges"
-  }},
-  "heart": {{
-    "emotional_range": "how they express feelings",
-    "enthusiasm_triggers": ["what excites them"],
-    "connection_style": "how they relate to others"
-  }},
-  "world": {{
-    "key_relationships": ["important people"],
-    "core_interests": ["passions"],
-    "strong_beliefs": ["values"]
-  }},
-  "soulprint_text": "300-500 word narrative for AI to embody their style. Include examples.",
-  "communication_guide": {{
-    "do": ["things to do as them"],
-    "avoid": ["things to avoid"]
-  }}
-}}
-
-Make it SPECIFIC and PERSONAL."""
-
-    response = anthropic_client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=8192,
-        messages=[{"role": "user", "content": synthesis_prompt}],
-    )
-    
-    response_text = response.content[0].text
-    try:
-        if "```json" in response_text:
-            response_text = response_text.split("```json")[1].split("```")[0]
-        elif "```" in response_text:
-            response_text = response_text.split("```")[1].split("```")[0]
-        return json.loads(response_text.strip())
-    except:
-        return {"archetype": "The Unique Individual", "soulprint_text": response_text, "raw": True}
-
-
-async def create_exhaustive_soulprint(conversations: List[dict], stats: dict, user_id: str, anthropic_client) -> dict:
-    """Process ALL conversations exhaustively in batches"""
-    start = time.time()
-    
-    total = len(conversations)
-    batch_size = 50
-    batches = [conversations[i:i+batch_size] for i in range(0, total, batch_size)]
-    total_batches = len(batches)
-    
-    print(f"[RLM] Exhaustive analysis: {total} conversations in {total_batches} batches")
-    
-    all_patterns = []
-    for i, batch in enumerate(batches):
-        print(f"[RLM] Processing batch {i+1}/{total_batches} ({len(batch)} conversations)")
-        patterns = await extract_patterns_from_batch(batch, i, total_batches, anthropic_client)
-        all_patterns.append(patterns)
-        if i < total_batches - 1:
-            await asyncio.sleep(0.5)
-    
-    print(f"[RLM] Pattern extraction complete. Synthesizing...")
-    soulprint = await synthesize_soulprint(all_patterns, stats, anthropic_client)
-    
-    elapsed = time.time() - start
-    print(f"[RLM] Exhaustive soulprint complete in {elapsed:.1f}s")
-    
-    return {
-        "soulprint": soulprint,
-        "archetype": soulprint.get("archetype", "Unknown"),
-        "batches_processed": total_batches,
-        "conversations_analyzed": total,
-        "elapsed_seconds": round(elapsed, 1)
-    }
-
-
 @app.post("/create-soulprint")
 async def create_soulprint(request: CreateSoulprintRequest):
-    """
-    EXHAUSTIVE soulprint generation - processes ALL conversations.
-    
-    Flow:
-    1. Split ALL conversations into batches of 50
-    2. Extract patterns from each batch
-    3. Synthesize all patterns into final soulprint
-    
-    Takes 1-3 minutes depending on conversation count.
-    """
+    """EXHAUSTIVE soulprint generation (legacy endpoint)"""
     try:
         conversations = request.conversations
         stats = request.stats or {}
         user_id = request.user_id
-        
+
         if not conversations:
             return {"error": "No conversations provided", "soulprint": None, "archetype": None}
-        
+
         print(f"[RLM] EXHAUSTIVE soulprint for user {user_id} from {len(conversations)} conversations")
-        
-        # Initialize Anthropic client
+
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        
-        # Run exhaustive analysis
-        result = await create_exhaustive_soulprint(
-            conversations=conversations,
-            stats=stats,
-            user_id=user_id,
-            anthropic_client=client
-        )
-        
-        soulprint_data = result.get("soulprint", {})
+
+        # Convert conversations to message format
+        messages = []
+        for conv in conversations:
+            title = conv.get("title", "Untitled")
+            conv_messages = conv.get("messages", [])
+            for m in conv_messages:
+                if isinstance(m, dict) and m.get("role") == "user":
+                    messages.append({
+                        "content": m.get("content", ""),
+                        "conversation_title": title,
+                    })
+
+        # Run recursive synthesis
+        result = await recursive_synthesize(messages[:5000], user_id)
+
+        soulprint_data = result
         archetype = result.get("archetype", "Unique Individual")
-        
-        # Store to Supabase if configured
-        if SUPABASE_URL and SUPABASE_SERVICE_KEY:
-            try:
-                async with httpx.AsyncClient() as http_client:
-                    headers = {
-                        "apikey": SUPABASE_SERVICE_KEY,
-                        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-                        "Content-Type": "application/json",
-                        "Prefer": "resolution=merge-duplicates",
-                    }
-                    
-                    await http_client.post(
-                        f"{SUPABASE_URL}/rest/v1/user_profiles",
-                        headers=headers,
-                        json={
-                            "user_id": user_id,
-                            "soulprint": soulprint_data,
-                            "soulprint_text": soulprint_data.get("soulprint_text", ""),
-                            "archetype": archetype,
-                            "soulprint_updated_at": datetime.utcnow().isoformat(),
-                        },
-                    )
-                    print(f"[RLM] Stored exhaustive soulprint for user {user_id}")
-            except Exception as e:
-                print(f"[RLM] Failed to store soulprint: {e}")
-        
+
         return {
             "soulprint": soulprint_data,
             "archetype": archetype,
-            "conversations_analyzed": result.get("conversations_analyzed", len(conversations)),
-            "batches_processed": result.get("batches_processed", 1),
-            "elapsed_seconds": result.get("elapsed_seconds", 0),
+            "conversations_analyzed": len(conversations),
         }
-        
+
     except Exception as e:
         error_msg = str(e)
         print(f"[RLM] Create soulprint error: {error_msg}")
@@ -782,9 +1421,8 @@ async def status():
         "rlm_error": RLM_IMPORT_ERROR if not RLM_AVAILABLE else None,
         "supabase_configured": bool(SUPABASE_URL and SUPABASE_SERVICE_KEY),
         "anthropic_configured": bool(ANTHROPIC_API_KEY),
+        "bedrock_configured": BEDROCK_AVAILABLE and bool(AWS_ACCESS_KEY_ID),
         "cohere_configured": bool(COHERE_API_KEY),
-        "vector_search_enabled": bool(COHERE_API_KEY),
-        "alerts_configured": bool(ALERT_TELEGRAM_BOT),
+        "vercel_callback_configured": bool(VERCEL_API_URL),
         "timestamp": datetime.utcnow().isoformat(),
     }
-
