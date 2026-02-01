@@ -214,22 +214,22 @@ async def alert_drew(message: str):
 
 
 # ============================================================================
-# VECTOR SEARCH (Bedrock + Supabase)
+# VECTOR SEARCH (Bedrock Titan + conversation_chunks)
 # ============================================================================
 
 async def search_memories(user_id: str, query: str, limit: int = 50) -> List[dict]:
-    """Search imported_chats by vector similarity using Bedrock embeddings"""
+    """Search conversation_chunks by vector similarity using Bedrock Titan embeddings"""
 
-    # Generate query embedding
+    # Generate query embedding with Bedrock Titan
     query_embedding = await embed_text_bedrock(query)
     if not query_embedding:
         print("[RLM] Failed to generate query embedding, using fallback")
-        return await get_recent_messages(user_id, limit)
+        return await get_recent_chunks(user_id, limit)
 
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                f"{SUPABASE_URL}/rest/v1/rpc/match_imported_chats",
+                f"{SUPABASE_URL}/rest/v1/rpc/match_conversation_chunks",
                 headers={
                     "apikey": SUPABASE_SERVICE_KEY,
                     "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
@@ -246,27 +246,26 @@ async def search_memories(user_id: str, query: str, limit: int = 50) -> List[dic
 
             if response.status_code == 200:
                 memories = response.json()
-                print(f"[RLM] Vector search returned {len(memories)} memories")
+                print(f"[RLM] Vector search returned {len(memories)} memories from conversation_chunks")
                 return memories
             else:
-                print(f"[RLM] Vector search error: {response.status_code}")
-                return await get_recent_messages(user_id, limit)
+                print(f"[RLM] Vector search error: {response.status_code} - {response.text}")
+                return await get_recent_chunks(user_id, limit)
     except Exception as e:
         print(f"[RLM] Vector search exception: {e}")
-        return await get_recent_messages(user_id, limit)
+        return await get_recent_chunks(user_id, limit)
 
 
-async def get_recent_messages(user_id: str, limit: int = 100) -> List[dict]:
-    """Fallback: get recent messages without vector search"""
+async def get_recent_chunks(user_id: str, limit: int = 100) -> List[dict]:
+    """Fallback: get recent chunks without vector search"""
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(
-                f"{SUPABASE_URL}/rest/v1/imported_chats",
+                f"{SUPABASE_URL}/rest/v1/conversation_chunks",
                 params={
                     "user_id": f"eq.{user_id}",
-                    "role": "eq.user",
-                    "select": "id,content,conversation_title,original_timestamp",
-                    "order": "original_timestamp.desc",
+                    "select": "id,content,title,message_count,created_at",
+                    "order": "created_at.desc",
                     "limit": str(limit),
                 },
                 headers={
@@ -277,21 +276,19 @@ async def get_recent_messages(user_id: str, limit: int = 100) -> List[dict]:
             )
             return response.json() if response.status_code == 200 else []
     except Exception as e:
-        print(f"[RLM] Recent messages error: {e}")
+        print(f"[RLM] Recent chunks error: {e}")
         return []
 
 
 async def get_soulprint(user_id: str) -> dict:
-    """Get SoulPrint files from soulprints table"""
+    """Get SoulPrint files from user_profiles table"""
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(
-                f"{SUPABASE_URL}/rest/v1/soulprints",
+                f"{SUPABASE_URL}/rest/v1/user_profiles",
                 params={
                     "user_id": f"eq.{user_id}",
-                    "select": "soul_md,identity_md,agents_md,user_md,archetype,name",
-                    "order": "updated_at.desc",
-                    "limit": "1",
+                    "select": "soul_md,identity_md,agents_md,user_md,archetype,soulprint,soulprint_text",
                 },
                 headers={
                     "apikey": SUPABASE_SERVICE_KEY,
