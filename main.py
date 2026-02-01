@@ -193,9 +193,10 @@ BEDROCK_EMBEDDING_MODEL_ID = os.getenv("BEDROCK_EMBEDDING_MODEL_ID", "amazon.tit
 VERCEL_API_URL = os.getenv("VERCEL_API_URL")
 RLM_API_KEY = os.getenv("RLM_API_KEY")  # Shared secret for auth
 
-# Models
-HAIKU_MODEL = "claude-3-5-haiku-20241022"  # Fast, cheap for chunk analysis
-SONNET_MODEL = "claude-sonnet-4-20250514"  # Smart for synthesis
+# Models - AWS Bedrock format
+HAIKU_MODEL = "us.anthropic.claude-3-5-haiku-20241022-v1:0"  # Fast, cheap for chunk analysis
+SONNET_MODEL = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"  # Smart for synthesis
+USE_BEDROCK_CLAUDE = True  # Use AWS Bedrock instead of Anthropic API
 
 
 class QueryRequest(BaseModel):
@@ -337,6 +338,83 @@ async def embed_texts_batch(texts: List[str], batch_size: int = 10) -> List[Opti
             await asyncio.sleep(0.5)  # Batch delay
 
     return embeddings
+
+
+# ============================================================================
+# BEDROCK CLAUDE (Text Generation)
+# ============================================================================
+
+async def bedrock_claude_message(
+    messages: List[dict],
+    model: str = None,
+    system: str = None,
+    max_tokens: int = 4096,
+    bedrock_client=None
+) -> str:
+    """
+    Call Claude via AWS Bedrock Converse API.
+
+    Args:
+        messages: List of {"role": "user"|"assistant", "content": "text"}
+        model: Bedrock model ID (defaults to SONNET_MODEL)
+        system: Optional system prompt
+        max_tokens: Max response tokens
+        bedrock_client: Optional existing client
+
+    Returns:
+        Response text string
+    """
+    if not bedrock_client:
+        bedrock_client = get_bedrock_client()
+    if not bedrock_client:
+        raise Exception("Bedrock client not available")
+
+    model = model or SONNET_MODEL
+
+    # Convert messages to Bedrock format
+    bedrock_messages = []
+    for msg in messages:
+        bedrock_messages.append({
+            "role": msg["role"],
+            "content": [{"text": msg["content"]}]
+        })
+
+    # Build request
+    request_body = {
+        "modelId": model,
+        "messages": bedrock_messages,
+        "inferenceConfig": {
+            "maxTokens": max_tokens,
+            "temperature": 0.7,
+        }
+    }
+
+    if system:
+        request_body["system"] = [{"text": system}]
+
+    try:
+        # Use run_in_executor to call sync boto3 in async context
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: bedrock_client.converse(**request_body)
+        )
+
+        # Extract text from response
+        output = response.get("output", {})
+        message = output.get("message", {})
+        content = message.get("content", [])
+
+        text_parts = []
+        for block in content:
+            if "text" in block:
+                text_parts.append(block["text"])
+
+        return "".join(text_parts)
+
+    except Exception as e:
+        print(f"[RLM] Bedrock Claude error: {e}")
+        raise
 
 
 # ============================================================================
@@ -735,19 +813,18 @@ async def chat(request: ChatRequest):
 - If the user asks about something from their past, the relevant memories are provided above.
 - Keep responses concise but personal."""
 
-        # Generate response
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        response = client.messages.create(
+        # Generate response using Bedrock Claude
+        response_text = await bedrock_claude_message(
+            messages=[{"role": "user", "content": request.message}],
+            system=system_prompt[:15000],
             model=SONNET_MODEL,
             max_tokens=2048,
-            system=system_prompt[:15000],  # Limit system prompt
-            messages=[{"role": "user", "content": request.message}],
         )
 
         latency = int((time.time() - start) * 1000)
 
         return ChatResponse(
-            response=response.content[0].text,
+            response=response_text,
             memories_used=len(memories),
             latency_ms=latency,
         )
@@ -985,16 +1062,14 @@ async def process_import_background(user_id: str, user_email: Optional[str], con
 
 async def recursive_synthesize(messages: List[dict], user_id: str, batch_size: int = 100) -> dict:
     """
-    Recursive synthesis using Haiku for chunks, Sonnet for synthesis.
+    Recursive synthesis using Haiku for chunks, Sonnet for synthesis via Bedrock.
 
     Level 1: Haiku processes batches → summaries
     Level 2+: Sonnet merges summaries → until single result
     """
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
     if len(messages) <= batch_size:
         # Base case: small enough for single Sonnet call
-        return await sonnet_generate_profile(messages, client)
+        return await sonnet_generate_profile(messages)
 
     # Level 1: Process batches with Haiku (fast, cheap)
     print(f"[RLM] Level 1: Processing {len(messages)} messages in batches of {batch_size}")
@@ -1004,16 +1079,16 @@ async def recursive_synthesize(messages: List[dict], user_id: str, batch_size: i
 
     for i, batch in enumerate(batches):
         print(f"[RLM] Haiku processing batch {i+1}/{len(batches)}")
-        summary = await haiku_extract_patterns(batch, i, len(batches), client)
+        summary = await haiku_extract_patterns(batch, i, len(batches))
         summaries.append(summary)
         await asyncio.sleep(0.3)  # Rate limit
 
     # Level 2+: Recursive merge with Sonnet
     print(f"[RLM] Level 2: Merging {len(summaries)} summaries")
-    return await recursive_merge_summaries(summaries, client)
+    return await recursive_merge_summaries(summaries)
 
 
-async def haiku_extract_patterns(batch: List[dict], batch_num: int, total_batches: int, client) -> dict:
+async def haiku_extract_patterns(batch: List[dict], batch_num: int, total_batches: int) -> dict:
     """Level 1: Haiku extracts patterns from a batch of messages"""
 
     # Build message text
@@ -1064,13 +1139,12 @@ Return JSON:
 Be SPECIFIC. Quote actual text. Return valid JSON only."""
 
     try:
-        response = client.messages.create(
+        # Use Bedrock Claude
+        text = await bedrock_claude_message(
+            messages=[{"role": "user", "content": prompt}],
             model=HAIKU_MODEL,
             max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}],
         )
-
-        text = response.content[0].text
 
         # Parse JSON
         if "```json" in text:
@@ -1084,26 +1158,26 @@ Be SPECIFIC. Quote actual text. Return valid JSON only."""
         return {"error": str(e), "batch": batch_num}
 
 
-async def recursive_merge_summaries(summaries: List[dict], client, merge_size: int = 10) -> dict:
+async def recursive_merge_summaries(summaries: List[dict], merge_size: int = 10) -> dict:
     """Recursively merge summaries until we have a single profile"""
 
     if len(summaries) <= merge_size:
         # Final merge
-        return await sonnet_final_synthesis(summaries, client)
+        return await sonnet_final_synthesis(summaries)
 
     # Merge in groups
     merged = []
     for i in range(0, len(summaries), merge_size):
         group = summaries[i:i+merge_size]
-        partial = await sonnet_merge_partial(group, client)
+        partial = await sonnet_merge_partial(group)
         merged.append(partial)
         await asyncio.sleep(0.5)
 
     # Recurse
-    return await recursive_merge_summaries(merged, client, merge_size)
+    return await recursive_merge_summaries(merged, merge_size)
 
 
-async def sonnet_merge_partial(summaries: List[dict], client) -> dict:
+async def sonnet_merge_partial(summaries: List[dict]) -> dict:
     """Sonnet merges a group of summaries into one"""
 
     prompt = f"""Merge these personality summaries into one consolidated summary.
@@ -1118,13 +1192,13 @@ Deduplicate but preserve unique insights.
 Return JSON with same structure as input summaries, but merged."""
 
     try:
-        response = client.messages.create(
+        # Use Bedrock Claude
+        text = await bedrock_claude_message(
+            messages=[{"role": "user", "content": prompt}],
             model=SONNET_MODEL,
             max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}],
         )
 
-        text = response.content[0].text
         if "```json" in text:
             text = text.split("```json")[1].split("```")[0]
         elif "```" in text:
@@ -1136,7 +1210,7 @@ Return JSON with same structure as input summaries, but merged."""
         return {"merged": summaries, "error": str(e)}
 
 
-async def sonnet_final_synthesis(summaries: List[dict], client) -> dict:
+async def sonnet_final_synthesis(summaries: List[dict]) -> dict:
     """Sonnet creates final personality profile from all summaries"""
 
     prompt = f"""Create a comprehensive personality profile from these analyzed patterns.
@@ -1185,13 +1259,13 @@ Return JSON:
 Make it DEEPLY PERSONAL and SPECIFIC."""
 
     try:
-        response = client.messages.create(
+        # Use Bedrock Claude
+        text = await bedrock_claude_message(
+            messages=[{"role": "user", "content": prompt}],
             model=SONNET_MODEL,
             max_tokens=8192,
-            messages=[{"role": "user", "content": prompt}],
         )
 
-        text = response.content[0].text
         if "```json" in text:
             text = text.split("```json")[1].split("```")[0]
         elif "```" in text:
@@ -1203,7 +1277,7 @@ Make it DEEPLY PERSONAL and SPECIFIC."""
         return {"archetype": "Unique Individual", "error": str(e)}
 
 
-async def sonnet_generate_profile(messages: List[dict], client) -> dict:
+async def sonnet_generate_profile(messages: List[dict]) -> dict:
     """Generate profile from small message set (base case)"""
 
     msg_text = ""
@@ -1223,13 +1297,13 @@ Return JSON with: archetype, core_essence, voice, mind, heart, world, best_quote
 Be specific and quote actual text."""
 
     try:
-        response = client.messages.create(
+        # Use Bedrock Claude
+        text = await bedrock_claude_message(
+            messages=[{"role": "user", "content": prompt}],
             model=SONNET_MODEL,
             max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}],
         )
 
-        text = response.content[0].text
         if "```json" in text:
             text = text.split("```json")[1].split("```")[0]
         elif "```" in text:
@@ -1241,9 +1315,7 @@ Be specific and quote actual text."""
 
 
 async def generate_soulprint_files(profile: dict, messages: List[dict], user_id: str) -> dict:
-    """Generate the four SoulPrint markdown files"""
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    """Generate the four SoulPrint markdown files using Bedrock Claude"""
 
     # SOUL.md - Core personality
     soul_prompt = f"""Based on this personality profile, create SOUL.md - a comprehensive guide to who this person IS.
@@ -1264,12 +1336,11 @@ Write it as a reference guide for an AI to understand and embody this person's c
 Be specific with examples and quotes.
 Keep it under 2000 words."""
 
-    soul_response = client.messages.create(
+    soul_md = await bedrock_claude_message(
+        messages=[{"role": "user", "content": soul_prompt}],
         model=SONNET_MODEL,
         max_tokens=4096,
-        messages=[{"role": "user", "content": soul_prompt}],
     )
-    soul_md = soul_response.content[0].text
 
     # IDENTITY.md - AI persona
     identity_prompt = f"""Based on this profile, create IDENTITY.md - defining the AI persona.
@@ -1287,12 +1358,11 @@ Write IDENTITY.md covering:
 
 Keep it under 500 words. Be creative but grounded in their actual patterns."""
 
-    identity_response = client.messages.create(
+    identity_md = await bedrock_claude_message(
+        messages=[{"role": "user", "content": identity_prompt}],
         model=SONNET_MODEL,
         max_tokens=1024,
-        messages=[{"role": "user", "content": identity_prompt}],
     )
-    identity_md = identity_response.content[0].text
 
     # AGENTS.md - Behavior rules
     agents_prompt = f"""Based on this profile, create AGENTS.md - operational rules for the AI.
@@ -1310,12 +1380,11 @@ Write AGENTS.md covering:
 
 Keep it under 1000 words. Make rules actionable and specific."""
 
-    agents_response = client.messages.create(
+    agents_md = await bedrock_claude_message(
+        messages=[{"role": "user", "content": agents_prompt}],
         model=SONNET_MODEL,
         max_tokens=2048,
-        messages=[{"role": "user", "content": agents_prompt}],
     )
-    agents_md = agents_response.content[0].text
 
     # USER.md - Facts about the user
     user_prompt = f"""Based on this profile, create USER.md - factual information about the user.
@@ -1334,12 +1403,11 @@ Write USER.md covering:
 
 Keep it under 1000 words. Stick to facts from the analysis."""
 
-    user_response = client.messages.create(
+    user_md = await bedrock_claude_message(
+        messages=[{"role": "user", "content": user_prompt}],
         model=SONNET_MODEL,
         max_tokens=2048,
-        messages=[{"role": "user", "content": user_prompt}],
     )
-    user_md = user_response.content[0].text
 
     return {
         "soul_md": soul_md,
@@ -1352,9 +1420,8 @@ Keep it under 1000 words. Stick to facts from the analysis."""
 async def generate_memory_log(messages: List[dict], profile: dict, user_id: str) -> str:
     """
     Generate a memory log summarizing the user's conversation history.
-    This creates a daily summary style log.
+    This creates a daily summary style log using Bedrock Claude.
     """
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     # Group messages by date
     messages_by_date = {}
@@ -1426,12 +1493,12 @@ Create a memory log in markdown format:
 Keep it concise but informative. This will help the AI remember context."""
 
     try:
-        response = client.messages.create(
-            model=HAIKU_MODEL,  # Use Haiku for speed
-            max_tokens=1024,
+        # Use Bedrock Claude
+        return await bedrock_claude_message(
             messages=[{"role": "user", "content": prompt}],
+            model=HAIKU_MODEL,
+            max_tokens=1024,
         )
-        return response.content[0].text
     except Exception as e:
         print(f"[RLM] Memory log error: {e}")
         return f"# Memory Log - {date.today()}\n\nFailed to generate: {e}"
@@ -1780,18 +1847,9 @@ async def query(request: QueryRequest):
         soulprint = request.soulprint_text or soulprint_text
         context = build_context(chunks, soulprint, request.history or [])
 
-        rlm = RLM(
-            backend="anthropic",
-            backend_kwargs={
-                "model_name": SONNET_MODEL,
-                "api_key": ANTHROPIC_API_KEY,
-            },
-            verbose=False,
-        )
-
         limited_context = context[:20000] if len(context) > 20000 else context
 
-        prompt = f"""You are SoulPrint, a personal AI with infinite memory of the user's conversation history.
+        system_prompt = f"""You are SoulPrint, a personal AI with infinite memory of the user's conversation history.
 
 {limited_context}
 
@@ -1799,29 +1857,20 @@ async def query(request: QueryRequest):
 - Use the conversation history to provide personalized, contextual responses
 - Reference relevant past conversations naturally
 - Be warm and helpful
-- Keep responses focused and concise
+- Keep responses focused and concise"""
 
-User's message: {request.message}"""
-
-        try:
-            result = rlm.completion(prompt)
-        except Exception as rlm_error:
-            print(f"[RLM] RLM execution failed: {rlm_error}, using direct call")
-            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-            response = client.messages.create(
-                model=SONNET_MODEL,
-                max_tokens=2048,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            class MockResult:
-                def __init__(self, text):
-                    self.response = text
-            result = MockResult(response.content[0].text)
+        # Use Bedrock Claude directly
+        response_text = await bedrock_claude_message(
+            messages=[{"role": "user", "content": request.message}],
+            system=system_prompt,
+            model=SONNET_MODEL,
+            max_tokens=2048,
+        )
 
         latency = int((time.time() - start) * 1000)
 
         return QueryResponse(
-            response=result.response,
+            response=response_text,
             chunks_used=len(chunks),
             method="rlm-bedrock" if (BEDROCK_AVAILABLE and AWS_ACCESS_KEY_ID) else "rlm-cohere",
             latency_ms=latency,
@@ -1899,13 +1948,12 @@ Based on these conversations, provide a JSON analysis with:
 
 Return ONLY valid JSON, no markdown."""
 
-            anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-            response = anthropic_client.messages.create(
+            # Use Bedrock Claude
+            analysis_text = await bedrock_claude_message(
+                messages=[{"role": "user", "content": analysis_prompt}],
                 model=SONNET_MODEL,
                 max_tokens=2048,
-                messages=[{"role": "user", "content": analysis_prompt}],
             )
-            analysis_text = response.content[0].text
 
             try:
                 json_match = re.search(r'\{[\s\S]*\}', analysis_text)
