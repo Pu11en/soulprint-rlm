@@ -146,24 +146,39 @@ async def embed_text_bedrock(text: str, bedrock_client=None) -> Optional[List[fl
         return None
 
     try:
-        # Truncate text to max input size
+        # Clean and validate text
+        if not text or not isinstance(text, str):
+            return None
+
+        # Remove null bytes and other problematic characters
+        text = text.replace('\x00', '').strip()
+
+        # Must have actual content
+        if len(text) < 3:
+            return None
+
+        # Truncate to max input size (Titan limit is ~8k tokens, ~32k chars safe)
         text = text[:8000]
+
+        # Titan Embed v2 request format - must match Vercel format exactly
+        request_body = json.dumps({
+            "inputText": text,
+            "dimensions": 768,
+            "normalize": True
+        }).encode('utf-8')
 
         response = bedrock_client.invoke_model(
             modelId="amazon.titan-embed-text-v2:0",
             contentType="application/json",
             accept="application/json",
-            body=json.dumps({
-                "inputText": text,
-                "dimensions": 768,  # Match existing schema
-                "normalize": True
-            })
+            body=request_body
         )
 
         result = json.loads(response['body'].read())
         return result.get('embedding')
     except Exception as e:
-        print(f"[RLM] Bedrock embed error: {e}")
+        # Only log first 100 chars of error to avoid spam
+        print(f"[RLM] Bedrock embed error: {str(e)[:100]}")
         return None
 
 
