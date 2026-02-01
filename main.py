@@ -1944,32 +1944,111 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
                 return
 
             # ============================================================
-            # STEP 1: Create multi-tier chunks
+            # STEP 1: Parse raw ChatGPT format and create multi-tier chunks
             # ============================================================
-            print(f"[RLM] Creating multi-tier chunks from {len(conversations)} conversations...")
+            print(f"[RLM] Parsing {len(conversations)} raw ChatGPT conversations...")
 
             all_chunks = []
             total_messages = 0
 
+            def parse_chatgpt_conversation(conv: dict) -> tuple:
+                """
+                Parse raw ChatGPT format with mapping structure.
+                Returns (messages_with_timestamps, conv_created_at)
+
+                Raw format has:
+                - mapping: { node_id: { message: { author, content, create_time } } }
+                - create_time: Unix timestamp for conversation
+                """
+                messages = []
+
+                # Get conversation-level timestamp
+                conv_create_time = conv.get("create_time")
+                if conv_create_time:
+                    conv_created_at = datetime.fromtimestamp(conv_create_time).isoformat()
+                else:
+                    conv_created_at = datetime.utcnow().isoformat()
+
+                # Parse mapping structure (ChatGPT's nested format)
+                mapping = conv.get("mapping", {})
+                for node_id, node in mapping.items():
+                    if not isinstance(node, dict):
+                        continue
+
+                    msg = node.get("message")
+                    if not msg or not isinstance(msg, dict):
+                        continue
+
+                    # Get message content
+                    content_obj = msg.get("content", {})
+                    if not isinstance(content_obj, dict):
+                        continue
+
+                    parts = content_obj.get("parts", [])
+                    if not parts:
+                        continue
+
+                    # Only text content (skip images, files)
+                    text_content = ""
+                    for part in parts:
+                        if isinstance(part, str):
+                            text_content += part
+
+                    if not text_content.strip():
+                        continue
+
+                    # Get role
+                    author = msg.get("author", {})
+                    role = author.get("role", "user") if isinstance(author, dict) else "user"
+
+                    # Skip system messages
+                    if role == "system":
+                        continue
+
+                    # Get message timestamp
+                    msg_create_time = msg.get("create_time")
+                    if msg_create_time:
+                        msg_timestamp = datetime.fromtimestamp(msg_create_time).isoformat()
+                    else:
+                        msg_timestamp = conv_created_at
+
+                    messages.append({
+                        "role": role,
+                        "content": text_content,
+                        "timestamp": msg_timestamp,
+                        "create_time": msg_create_time or 0,  # For sorting
+                    })
+
+                # Sort messages by timestamp (mapping is unordered)
+                messages.sort(key=lambda m: m["create_time"])
+
+                return messages, conv_created_at
+
             for idx, conv in enumerate(conversations):  # Process ALL conversations
                 title = conv.get("title", "Untitled")
-                messages = conv.get("messages", [])
-                created_at = conv.get("createdAt") or conv.get("created_at") or datetime.utcnow().isoformat()
+                conv_id = conv.get("id") or conv.get("conversation_id") or f"conv_{idx}"
 
-                # Build full content from messages
+                # Parse raw ChatGPT format
+                messages, conv_created_at = parse_chatgpt_conversation(conv)
+
+                if not messages:
+                    continue
+
+                # Build full content WITH timestamps
                 full_content = ""
                 for m in messages[:30]:  # Max 30 messages per conversation
-                    if isinstance(m, dict):
-                        role = m.get("role", "user")
-                        content = m.get("content", "")
-                        if content:
-                            full_content += f"{role}: {content}\n"
-                            total_messages += 1
+                    role = m["role"]
+                    content = m["content"]
+                    timestamp = m["timestamp"]
+                    # Include timestamp in content for searchability
+                    full_content += f"[{timestamp}] {role}: {content}\n"
+                    total_messages += 1
 
                 if not full_content.strip():
                     continue
 
                 is_recent = idx < 100
+                message_count = len(messages)
 
                 # MICRO chunks (200 chars) - precise facts
                 MICRO_SIZE = 200
@@ -1978,12 +2057,12 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
                     if len(chunk_text) > 50:
                         all_chunks.append({
                             "user_id": user_id,
-                            "conversation_id": conv.get("id", f"conv_{idx}"),
+                            "conversation_id": conv_id,
                             "title": title,
                             "content": chunk_text,
                             "chunk_tier": "micro",
-                            "message_count": len(messages),
-                            "created_at": created_at,
+                            "message_count": message_count,
+                            "created_at": conv_created_at,
                             "is_recent": is_recent,
                         })
 
@@ -1992,12 +2071,12 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
                 if len(medium_content) > 100:
                     all_chunks.append({
                         "user_id": user_id,
-                        "conversation_id": conv.get("id", f"conv_{idx}"),
+                        "conversation_id": conv_id,
                         "title": title,
                         "content": medium_content,
                         "chunk_tier": "medium",
-                        "message_count": len(messages),
-                        "created_at": created_at,
+                        "message_count": message_count,
+                        "created_at": conv_created_at,
                         "is_recent": is_recent,
                     })
 
@@ -2006,12 +2085,12 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
                 if len(macro_content) > 500:
                     all_chunks.append({
                         "user_id": user_id,
-                        "conversation_id": conv.get("id", f"conv_{idx}"),
+                        "conversation_id": conv_id,
                         "title": title,
                         "content": macro_content,
                         "chunk_tier": "macro",
-                        "message_count": len(messages),
-                        "created_at": created_at,
+                        "message_count": message_count,
+                        "created_at": conv_created_at,
                         "is_recent": is_recent,
                     })
 
