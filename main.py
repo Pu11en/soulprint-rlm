@@ -62,6 +62,7 @@ ALERT_TELEGRAM_CHAT = os.getenv("ALERT_TELEGRAM_CHAT", "7414639817")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+BEDROCK_EMBEDDING_MODEL_ID = os.getenv("BEDROCK_EMBEDDING_MODEL_ID", "amazon.titan-embed-text-v2:0")
 
 # Vercel callback
 VERCEL_API_URL = os.getenv("VERCEL_API_URL")
@@ -168,7 +169,7 @@ async def embed_text_bedrock(text: str, bedrock_client=None) -> Optional[List[fl
         }).encode('utf-8')
 
         response = bedrock_client.invoke_model(
-            modelId="amazon.titan-embed-text-v2:0",
+            modelId=BEDROCK_EMBEDDING_MODEL_ID,
             contentType="application/json",
             accept="application/json",
             body=request_body
