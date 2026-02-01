@@ -2825,6 +2825,61 @@ async def generate_soulprint_from_chunks(user_id: str, client: httpx.AsyncClient
     print(f"[RLM] SoulPrint generated and saved for user {user_id}")
 
 
+@app.get("/generate-soulprint/{user_id}")
+async def generate_soulprint_endpoint(user_id: str):
+    """
+    Generate SoulPrint from existing chunks (use when embeddings are done but soulprint failed).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            headers = {
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                "Content-Type": "application/json",
+            }
+
+            # Check if chunks exist
+            check_resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/conversation_chunks",
+                params={"user_id": f"eq.{user_id}", "select": "id", "limit": "1"},
+                headers=headers,
+            )
+            chunks = check_resp.json() if check_resp.status_code == 200 else []
+            if not chunks:
+                return {"success": False, "error": "No chunks found for this user"}
+
+            # Generate soulprint
+            await generate_soulprint_from_chunks(user_id, client, headers)
+
+            # Update import status
+            await client.patch(
+                f"{SUPABASE_URL}/rest/v1/user_profiles",
+                params={"user_id": f"eq.{user_id}"},
+                headers=headers,
+                json={
+                    "import_status": "complete",
+                    "embedding_status": "complete",
+                },
+            )
+
+            # Trigger completion callback
+            vercel_url = os.environ.get("VERCEL_API_URL", "https://www.soulprintengine.ai")
+            try:
+                callback_resp = await client.post(
+                    f"{vercel_url}/api/import/complete",
+                    json={"user_id": user_id},
+                    timeout=30.0,
+                )
+                print(f"[RLM] Completion callback: {callback_resp.status_code}")
+            except Exception as e:
+                print(f"[RLM] Callback failed: {e}")
+
+            return {"success": True, "message": "SoulPrint generated and saved"}
+    except Exception as e:
+        print(f"[RLM] generate-soulprint error: {e}")
+        return {"success": False, "error": str(e)}
+
+
 @app.get("/status")
 async def status():
     """Detailed status for monitoring"""
