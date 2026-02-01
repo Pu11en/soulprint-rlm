@@ -2332,9 +2332,6 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
                         return False
 
                     # PATCH with return=representation to verify update happened
-                    # pgvector needs embedding as string format "[0.1, 0.2, ...]"
-                    embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
-
                     patch_headers = {
                         **headers,
                         "Prefer": "return=representation",
@@ -2343,7 +2340,7 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
                         f"{SUPABASE_URL}/rest/v1/conversation_chunks",
                         params={"id": f"eq.{chunk['id']}"},
                         headers=patch_headers,
-                        json={"embedding": embedding_str},
+                        json={"embedding": embedding},  # Send as array, not string
                     )
 
                     # Check status AND that a row was actually returned
