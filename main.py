@@ -196,6 +196,7 @@ RLM_API_KEY = os.getenv("RLM_API_KEY")  # Shared secret for auth
 # Models - AWS Bedrock format
 HAIKU_MODEL = "us.anthropic.claude-3-5-haiku-20241022-v1:0"  # Fast, cheap for chunk analysis
 SONNET_MODEL = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"  # Smart for synthesis
+NOVA_LITE_MODEL = "amazon.nova-lite-v1:0"  # Amazon's model - much higher rate limits
 USE_BEDROCK_CLAUDE = True  # Use AWS Bedrock instead of Anthropic API
 
 
@@ -1866,11 +1867,11 @@ async def query(request: QueryRequest):
 - Be warm and helpful
 - Keep responses focused and concise"""
 
-        # Use Bedrock Claude directly (Haiku for chat - 20x higher quota than Sonnet)
+        # Use Amazon Nova Lite for chat - much higher rate limits than Claude
         response_text = await bedrock_claude_message(
             messages=[{"role": "user", "content": request.message}],
             system=system_prompt,
-            model=HAIKU_MODEL,  # Sonnet quota is 1/min, Haiku is 20/min
+            model=NOVA_LITE_MODEL,  # Amazon's model - ~1000 req/min vs Claude's 20/min
             max_tokens=2048,
         )
 
