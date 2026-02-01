@@ -1845,8 +1845,13 @@ async def query(request: QueryRequest):
         )
 
     try:
-        chunks, soulprint_text = await get_user_data(request.user_id, query=request.message)
-        soulprint = request.soulprint_text or soulprint_text
+        # Use hybrid search (tier-aware vector + keyword)
+        chunks = await search_memories(request.user_id, request.message, limit=30)
+
+        # Get soulprint separately
+        soulprint_data = await get_soulprint(request.user_id)
+        soulprint = request.soulprint_text or (soulprint_data.get('soulprint_text') if soulprint_data else None)
+
         context = build_context(chunks, soulprint, request.history or [])
 
         limited_context = context[:20000] if len(context) > 20000 else context
