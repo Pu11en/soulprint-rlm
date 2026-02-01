@@ -2520,11 +2520,35 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
             print(f"[RLM] Embedded {embedded_count}/{len(chunks_to_embed)} chunks")
 
             # ============================================================
-            # STEP 4: Generate SoulPrint
+            # STEP 4: Generate SoulPrint (with retry)
             # ============================================================
             if job_id:
                 await update_job(job_id, current_step="synthesizing", progress=75)
-            await generate_soulprint_from_chunks(user_id, client, headers)
+
+            print(f"[RLM] Starting SoulPrint generation...")
+            soulprint_success = False
+            for attempt in range(3):  # 3 attempts
+                try:
+                    # Use fresh client for soulprint (old client may have stale connections)
+                    async with httpx.AsyncClient(timeout=300.0) as soulprint_client:
+                        soulprint_headers = {
+                            "apikey": SUPABASE_SERVICE_KEY,
+                            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                            "Content-Type": "application/json",
+                        }
+                        await generate_soulprint_from_chunks(user_id, soulprint_client, soulprint_headers)
+                    soulprint_success = True
+                    print(f"[RLM] SoulPrint generation completed on attempt {attempt + 1}")
+                    break
+                except Exception as sp_error:
+                    print(f"[RLM] SoulPrint attempt {attempt + 1} failed: {sp_error}")
+                    if attempt < 2:
+                        print(f"[RLM] Retrying SoulPrint generation in 5 seconds...")
+                        await asyncio.sleep(5)
+
+            if not soulprint_success:
+                print(f"[RLM] SoulPrint generation failed after 3 attempts - embeddings saved, user can retry via /generate-soulprint/{user_id}")
+                await alert_drew(f"⚠️ SoulPrint failed for {user_id} - embeddings done, needs manual /generate-soulprint")
 
             # Final status update
             elapsed = time.time() - start
