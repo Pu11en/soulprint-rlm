@@ -1669,6 +1669,99 @@ async def test_embed():
         }
 
 
+@app.get("/test-patch")
+async def test_patch():
+    """
+    Test the full embedding PATCH flow:
+    1. Insert a test chunk
+    2. Generate embedding with Bedrock
+    3. PATCH embedding to Supabase
+    4. Verify it was saved
+    5. Clean up
+    """
+    test_user_id = "00000000-0000-0000-0000-000000000000"  # Dummy user
+    test_chunk_id = None
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        headers = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        }
+
+        try:
+            # Step 1: Insert test chunk
+            insert_resp = await client.post(
+                f"{SUPABASE_URL}/rest/v1/conversation_chunks",
+                headers=headers,
+                json={
+                    "user_id": test_user_id,
+                    "conversation_id": "test-conv",
+                    "title": "Test Chunk",
+                    "content": "This is a test chunk for verifying the embedding PATCH flow works correctly.",
+                    "chunk_tier": "micro",
+                },
+            )
+            if insert_resp.status_code not in (200, 201):
+                return {"success": False, "step": "insert", "error": insert_resp.text[:200]}
+
+            inserted = insert_resp.json()
+            test_chunk_id = inserted[0]["id"] if inserted else None
+            if not test_chunk_id:
+                return {"success": False, "step": "insert", "error": "No chunk ID returned"}
+
+            # Step 2: Generate embedding
+            embedding = await embed_text_bedrock("This is a test chunk for verifying the embedding PATCH flow works correctly.")
+            if not embedding:
+                return {"success": False, "step": "embed", "error": "Bedrock returned no embedding"}
+
+            # Step 3: PATCH embedding
+            patch_resp = await client.patch(
+                f"{SUPABASE_URL}/rest/v1/conversation_chunks",
+                params={"id": f"eq.{test_chunk_id}"},
+                headers=headers,
+                json={"embedding": embedding},
+            )
+
+            if patch_resp.status_code not in (200, 204):
+                return {"success": False, "step": "patch", "error": f"Status {patch_resp.status_code}: {patch_resp.text[:200]}"}
+
+            patch_result = patch_resp.json() if patch_resp.text else []
+            if not patch_result:
+                return {"success": False, "step": "patch", "error": "PATCH returned empty - row not updated"}
+
+            # Step 4: Verify embedding was saved
+            verify_resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/conversation_chunks",
+                params={"id": f"eq.{test_chunk_id}", "select": "id,embedding"},
+                headers=headers,
+            )
+            verify_result = verify_resp.json() if verify_resp.status_code == 200 else []
+
+            if not verify_result or not verify_result[0].get("embedding"):
+                return {"success": False, "step": "verify", "error": "Embedding not found after PATCH"}
+
+            saved_dims = len(verify_result[0]["embedding"])
+
+            return {
+                "success": True,
+                "message": "Full PATCH flow works!",
+                "chunk_id": test_chunk_id,
+                "embedding_dims": len(embedding),
+                "saved_dims": saved_dims,
+            }
+
+        finally:
+            # Step 5: Clean up test chunk
+            if test_chunk_id:
+                await client.delete(
+                    f"{SUPABASE_URL}/rest/v1/conversation_chunks",
+                    params={"id": f"eq.{test_chunk_id}"},
+                    headers=headers,
+                )
+
+
 @app.post("/query", response_model=QueryResponse)
 async def query(request: QueryRequest):
     """Main query endpoint - TRUE RLM with vector similarity search"""
