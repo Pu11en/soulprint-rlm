@@ -2574,12 +2574,89 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
                 json={
                     "total_chunks": inserted_count,
                     "total_messages": total_messages,
-                    "embedding_status": "processing",
+                    "embedding_status": "pending",
+                    "memory_status": "building",  # New field for progressive UX
                 },
             )
 
             # ============================================================
-            # STEP 3: Embed all chunks (PARALLEL - balanced speed/cost)
+            # STEP 3: Generate SoulPrint FIRST (enables chat immediately)
+            # ============================================================
+            # SoulPrint uses raw chunks, not embeddings - so we do this first
+            # This way user can start chatting while embeddings run in background
+            if job_id:
+                await update_job(job_id, current_step="synthesizing", progress=40)
+
+            print(f"[RLM] Generating SoulPrint FIRST (for immediate chat access)...")
+            soulprint_success = False
+            for attempt in range(3):
+                try:
+                    async with httpx.AsyncClient(timeout=300.0) as soulprint_client:
+                        soulprint_headers = {
+                            "apikey": SUPABASE_SERVICE_KEY,
+                            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                            "Content-Type": "application/json",
+                        }
+                        await generate_soulprint_from_chunks(user_id, soulprint_client, soulprint_headers)
+                    soulprint_success = True
+                    print(f"[RLM] SoulPrint ready on attempt {attempt + 1}")
+                    break
+                except Exception as sp_error:
+                    print(f"[RLM] SoulPrint attempt {attempt + 1} failed: {sp_error}")
+                    if attempt < 2:
+                        await asyncio.sleep(3)
+
+            if not soulprint_success:
+                raise Exception("SoulPrint generation failed after 3 attempts")
+
+            # ============================================================
+            # STEP 3.5: EARLY NOTIFICATION - User can chat NOW!
+            # ============================================================
+            # Mark import as complete so user can start chatting
+            # Embeddings will continue in background to improve memory search
+            soulprint_time = time.time() - start
+            await client.patch(
+                f"{SUPABASE_URL}/rest/v1/user_profiles",
+                params={"user_id": f"eq.{user_id}"},
+                headers=headers,
+                json={
+                    "import_status": "complete",  # User can chat!
+                    "embedding_status": "processing",
+                    "memory_status": "building",  # Memory still improving
+                },
+            )
+
+            # Send email NOW - user can start chatting
+            vercel_url = os.environ.get("VERCEL_API_URL", "https://www.soulprintengine.ai")
+            try:
+                callback_resp = await client.post(
+                    f"{vercel_url}/api/import/complete",
+                    json={
+                        "user_id": user_id,
+                        "soulprint_ready": True,
+                        "memory_building": True,  # Indicate memory is still building
+                        "processing_time": soulprint_time,
+                    },
+                    headers={"Content-Type": "application/json"},
+                    timeout=30.0,
+                )
+                if callback_resp.status_code == 200:
+                    print(f"[RLM] ✅ Email sent - user can chat now! ({soulprint_time:.1f}s)")
+                else:
+                    print(f"[RLM] Vercel callback returned {callback_resp.status_code}")
+            except Exception as e:
+                print(f"[RLM] Vercel callback failed: {e}")
+
+            await alert_drew(
+                f"🚀 User Can Chat Now!\n\n"
+                f"User: {user_id}\n"
+                f"SoulPrint: ✅ Ready\n"
+                f"Time to chat: {soulprint_time:.1f}s\n"
+                f"Embeddings: Starting in background..."
+            )
+
+            # ============================================================
+            # STEP 4: Embed all chunks in BACKGROUND (improves memory over time)
             # ============================================================
             if job_id:
                 await update_job(job_id, current_step="embedding", progress=35)
@@ -2710,77 +2787,25 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
             if embedded_count < len(chunks_to_embed):
                 missing_count = len(chunks_to_embed) - embedded_count
                 print(f"[RLM] {missing_count} chunks still need embedding - scheduling completion...")
-                # Queue completion job to run after this function completes
                 asyncio.create_task(complete_embeddings_background(user_id))
 
             # ============================================================
-            # STEP 4: Generate SoulPrint (with retry)
+            # STEP 5: Final status update (embeddings done)
             # ============================================================
-            if job_id:
-                await update_job(job_id, current_step="synthesizing", progress=75)
-
-            print(f"[RLM] Starting SoulPrint generation...")
-            soulprint_success = False
-            for attempt in range(3):  # 3 attempts
-                try:
-                    # Use fresh client for soulprint (old client may have stale connections)
-                    async with httpx.AsyncClient(timeout=300.0) as soulprint_client:
-                        soulprint_headers = {
-                            "apikey": SUPABASE_SERVICE_KEY,
-                            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-                            "Content-Type": "application/json",
-                        }
-                        await generate_soulprint_from_chunks(user_id, soulprint_client, soulprint_headers)
-                    soulprint_success = True
-                    print(f"[RLM] SoulPrint generation completed on attempt {attempt + 1}")
-                    break
-                except Exception as sp_error:
-                    print(f"[RLM] SoulPrint attempt {attempt + 1} failed: {sp_error}")
-                    if attempt < 2:
-                        print(f"[RLM] Retrying SoulPrint generation in 5 seconds...")
-                        await asyncio.sleep(5)
-
-            if not soulprint_success:
-                print(f"[RLM] SoulPrint generation failed after 3 attempts - embeddings saved, user can retry via /generate-soulprint/{user_id}")
-                await alert_drew(f"⚠️ SoulPrint failed for {user_id} - embeddings done, needs manual /generate-soulprint")
-
-            # Final status update
             elapsed = time.time() - start
             await client.patch(
                 f"{SUPABASE_URL}/rest/v1/user_profiles",
                 params={"user_id": f"eq.{user_id}"},
                 headers=headers,
                 json={
-                    "import_status": "complete",
                     "embedding_status": "complete",
                     "embedding_progress": 100,
+                    "memory_status": "ready",  # Full memory now available
                     "processed_chunks": embedded_count,
                 },
             )
 
-            print(f"[RLM] Full processing complete in {elapsed:.1f}s")
-
-            # ============================================================
-            # STEP 5: Notify Vercel for email + push notification
-            # ============================================================
-            vercel_url = os.environ.get("VERCEL_API_URL", "https://www.soulprintengine.ai")
-            try:
-                callback_resp = await client.post(
-                    f"{vercel_url}/api/import/complete",
-                    json={
-                        "user_id": user_id,
-                        "chunks_embedded": embedded_count,
-                        "processing_time": elapsed,
-                    },
-                    headers={"Content-Type": "application/json"},
-                    timeout=30.0,
-                )
-                if callback_resp.status_code == 200:
-                    print(f"[RLM] Notified Vercel - email + push sent")
-                else:
-                    print(f"[RLM] Vercel callback returned {callback_resp.status_code}")
-            except Exception as e:
-                print(f"[RLM] Vercel callback failed: {e}")
+            print(f"[RLM] Full processing complete in {elapsed:.1f}s (user chatting since {soulprint_time:.1f}s)")
 
             # Mark job complete
             if job_id:
