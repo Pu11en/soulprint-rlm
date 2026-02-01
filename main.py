@@ -816,11 +816,11 @@ async def chat(request: ChatRequest):
 - If the user asks about something from their past, the relevant memories are provided above.
 - Keep responses concise but personal."""
 
-        # Generate response using Bedrock Claude
+        # Generate response using Amazon Nova Lite (higher rate limits than Claude)
         response_text = await bedrock_claude_message(
             messages=[{"role": "user", "content": request.message}],
             system=system_prompt[:15000],
-            model=SONNET_MODEL,
+            model=NOVA_LITE_MODEL,  # Amazon's model - ~1000 req/min vs Claude's 20/min
             max_tokens=2048,
         )
 
@@ -1711,6 +1711,137 @@ async def health():
     }
 
 
+@app.get("/health-deep")
+async def health_deep():
+    """
+    Deep health check - verifies:
+    1. Supabase DB connection
+    2. Vector search functions exist (match_conversation_chunks, match_conversation_chunks_by_tier)
+    3. Bedrock embeddings work
+    4. Nova Lite chat model works
+
+    Use this to verify the system is fully operational.
+    """
+    results = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "checks": {},
+        "overall": "healthy",
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        headers = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        # 1. Check DB connection
+        try:
+            db_resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/user_profiles",
+                params={"select": "user_id", "limit": "1"},
+                headers=headers,
+            )
+            results["checks"]["db_connection"] = {
+                "status": "ok" if db_resp.status_code == 200 else "error",
+                "http_status": db_resp.status_code,
+            }
+        except Exception as e:
+            results["checks"]["db_connection"] = {"status": "error", "error": str(e)[:100]}
+            results["overall"] = "unhealthy"
+
+        # 2. Check match_conversation_chunks function
+        try:
+            # Call with dummy embedding (all zeros) - should return empty but not error
+            dummy_embedding = [0.0] * 1024
+            func_resp = await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/match_conversation_chunks",
+                headers=headers,
+                json={
+                    "query_embedding": dummy_embedding,
+                    "match_user_id": "00000000-0000-0000-0000-000000000000",
+                    "match_count": 1,
+                    "match_threshold": 0.99,
+                },
+            )
+            if func_resp.status_code == 200:
+                results["checks"]["match_conversation_chunks"] = {"status": "ok"}
+            else:
+                results["checks"]["match_conversation_chunks"] = {
+                    "status": "error",
+                    "http_status": func_resp.status_code,
+                    "error": func_resp.text[:200],
+                }
+                results["overall"] = "unhealthy"
+        except Exception as e:
+            results["checks"]["match_conversation_chunks"] = {"status": "error", "error": str(e)[:100]}
+            results["overall"] = "unhealthy"
+
+        # 3. Check match_conversation_chunks_by_tier function
+        try:
+            tier_resp = await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/match_conversation_chunks_by_tier",
+                headers=headers,
+                json={
+                    "query_embedding": dummy_embedding,
+                    "match_user_id": "00000000-0000-0000-0000-000000000000",
+                    "match_tier": "macro",
+                    "match_count": 1,
+                    "match_threshold": 0.99,
+                },
+            )
+            if tier_resp.status_code == 200:
+                results["checks"]["match_conversation_chunks_by_tier"] = {"status": "ok"}
+            else:
+                results["checks"]["match_conversation_chunks_by_tier"] = {
+                    "status": "error",
+                    "http_status": tier_resp.status_code,
+                    "error": tier_resp.text[:200],
+                }
+                results["overall"] = "unhealthy"
+        except Exception as e:
+            results["checks"]["match_conversation_chunks_by_tier"] = {"status": "error", "error": str(e)[:100]}
+            results["overall"] = "unhealthy"
+
+    # 4. Check Bedrock embeddings
+    try:
+        test_embedding = await embed_text_bedrock("health check test")
+        if test_embedding and len(test_embedding) == 1024:
+            results["checks"]["bedrock_embeddings"] = {
+                "status": "ok",
+                "dimensions": len(test_embedding),
+            }
+        else:
+            results["checks"]["bedrock_embeddings"] = {
+                "status": "error",
+                "error": "No embedding returned or wrong dimensions",
+            }
+            results["overall"] = "unhealthy"
+    except Exception as e:
+        results["checks"]["bedrock_embeddings"] = {"status": "error", "error": str(e)[:100]}
+        results["overall"] = "unhealthy"
+
+    # 5. Check Nova Lite model (quick test)
+    try:
+        test_resp = await bedrock_claude_message(
+            messages=[{"role": "user", "content": "Say 'ok' and nothing else."}],
+            model=NOVA_LITE_MODEL,
+            max_tokens=10,
+        )
+        if test_resp and "ok" in test_resp.lower():
+            results["checks"]["nova_lite_model"] = {"status": "ok"}
+        else:
+            results["checks"]["nova_lite_model"] = {
+                "status": "warning",
+                "response": test_resp[:50] if test_resp else "empty",
+            }
+    except Exception as e:
+        results["checks"]["nova_lite_model"] = {"status": "error", "error": str(e)[:100]}
+        # Don't mark as unhealthy for chat model - embeddings are more critical
+
+    return results
+
+
 @app.get("/test-embed")
 async def test_embed():
     """Test Bedrock embedding with a simple string"""
@@ -2575,6 +2706,13 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
 
             print(f"[RLM] Embedded {embedded_count}/{len(chunks_to_embed)} chunks")
 
+            # Check for any missing embeddings and complete them
+            if embedded_count < len(chunks_to_embed):
+                missing_count = len(chunks_to_embed) - embedded_count
+                print(f"[RLM] {missing_count} chunks still need embedding - scheduling completion...")
+                # Queue completion job to run after this function completes
+                asyncio.create_task(complete_embeddings_background(user_id))
+
             # ============================================================
             # STEP 4: Generate SoulPrint (with retry)
             # ============================================================
@@ -3001,3 +3139,267 @@ async def status():
         "vercel_callback_configured": bool(VERCEL_API_URL),
         "timestamp": datetime.utcnow().isoformat(),
     }
+
+
+# ============================================================================
+# AUTOMATIC EMBEDDING COMPLETION
+# ============================================================================
+
+@app.get("/embedding-status/{user_id}")
+async def embedding_status(user_id: str):
+    """
+    Check embedding status for a user.
+    Returns counts by tier and overall completion percentage.
+    """
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        headers = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        }
+
+        # Get counts by tier - with embeddings
+        embedded_resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/conversation_chunks",
+            params={
+                "user_id": f"eq.{user_id}",
+                "embedding": "not.is.null",
+                "select": "chunk_tier",
+            },
+            headers=headers,
+        )
+        embedded = embedded_resp.json() if embedded_resp.status_code == 200 else []
+
+        # Get counts by tier - without embeddings
+        missing_resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/conversation_chunks",
+            params={
+                "user_id": f"eq.{user_id}",
+                "embedding": "is.null",
+                "select": "chunk_tier",
+            },
+            headers=headers,
+        )
+        missing = missing_resp.json() if missing_resp.status_code == 200 else []
+
+        # Count by tier
+        embedded_by_tier = {"macro": 0, "medium": 0, "micro": 0}
+        missing_by_tier = {"macro": 0, "medium": 0, "micro": 0}
+
+        for chunk in embedded:
+            tier = chunk.get("chunk_tier", "unknown")
+            if tier in embedded_by_tier:
+                embedded_by_tier[tier] += 1
+
+        for chunk in missing:
+            tier = chunk.get("chunk_tier", "unknown")
+            if tier in missing_by_tier:
+                missing_by_tier[tier] += 1
+
+        total_embedded = sum(embedded_by_tier.values())
+        total_missing = sum(missing_by_tier.values())
+        total = total_embedded + total_missing
+        completion_pct = int((total_embedded / total * 100)) if total > 0 else 0
+
+        return {
+            "user_id": user_id,
+            "total_chunks": total,
+            "total_embedded": total_embedded,
+            "total_missing": total_missing,
+            "completion_percentage": completion_pct,
+            "embedded_by_tier": embedded_by_tier,
+            "missing_by_tier": missing_by_tier,
+            "status": "complete" if total_missing == 0 else "incomplete",
+        }
+
+
+@app.post("/complete-embeddings/{user_id}")
+async def complete_embeddings(user_id: str, background_tasks: BackgroundTasks):
+    """
+    Complete missing embeddings for a user.
+    This endpoint is called automatically after import but can also be triggered manually.
+    Runs in background and returns immediately.
+
+    Use /embedding-status/{user_id} to check progress.
+    """
+    # Check current status first
+    status = await embedding_status(user_id)
+
+    if status["total_missing"] == 0:
+        return {
+            "success": True,
+            "message": "All embeddings already complete",
+            "status": status,
+        }
+
+    # Start background job
+    background_tasks.add_task(complete_embeddings_background, user_id)
+
+    return {
+        "success": True,
+        "message": f"Started embedding {status['total_missing']} missing chunks in background",
+        "status": status,
+        "note": "Use GET /embedding-status/{user_id} to check progress",
+    }
+
+
+async def complete_embeddings_background(user_id: str):
+    """
+    Background job to complete missing embeddings.
+    Embeds all chunks with NULL embeddings until complete.
+    """
+    print(f"[RLM] Starting embedding completion for user {user_id}")
+    start = time.time()
+    total_embedded = 0
+    batch_number = 0
+    MAX_BATCHES = 100  # Safety limit
+
+    bedrock_client = get_bedrock_client()
+    if not bedrock_client:
+        print(f"[RLM] ERROR: Bedrock client not available")
+        return
+
+    while batch_number < MAX_BATCHES:
+        batch_number += 1
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            headers = {
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                "Content-Type": "application/json",
+            }
+
+            # Fetch batch of chunks without embeddings
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/conversation_chunks",
+                params={
+                    "user_id": f"eq.{user_id}",
+                    "embedding": "is.null",
+                    "select": "id,content,chunk_tier",
+                    "limit": "50",  # Process 50 at a time
+                },
+                headers=headers,
+            )
+
+            if resp.status_code != 200:
+                print(f"[RLM] Failed to fetch chunks: {resp.text[:200]}")
+                break
+
+            chunks = resp.json()
+            if not chunks:
+                print(f"[RLM] No more chunks to embed - all complete!")
+                break
+
+            print(f"[RLM] Embedding batch {batch_number}: {len(chunks)} chunks")
+
+            # Embed each chunk
+            batch_embedded = 0
+            for chunk in chunks:
+                try:
+                    embedding = await embed_text_bedrock(chunk["content"], bedrock_client)
+
+                    if embedding:
+                        # Update chunk with embedding
+                        patch_resp = await client.patch(
+                            f"{SUPABASE_URL}/rest/v1/conversation_chunks",
+                            params={"id": f"eq.{chunk['id']}"},
+                            headers={**headers, "Prefer": "return=representation"},
+                            json={"embedding": embedding},
+                        )
+
+                        if patch_resp.status_code in (200, 204):
+                            batch_embedded += 1
+                            total_embedded += 1
+                        else:
+                            print(f"[RLM] PATCH failed for {chunk['id']}: {patch_resp.status_code}")
+
+                    await asyncio.sleep(0.05)  # Rate limit
+
+                except Exception as e:
+                    print(f"[RLM] Embed error for {chunk['id']}: {e}")
+
+            print(f"[RLM] Batch {batch_number} complete: {batch_embedded}/{len(chunks)} embedded")
+
+            # Update progress in user_profiles
+            await client.patch(
+                f"{SUPABASE_URL}/rest/v1/user_profiles",
+                params={"user_id": f"eq.{user_id}"},
+                headers=headers,
+                json={"processed_chunks": total_embedded},
+            )
+
+            # Brief pause between batches
+            await asyncio.sleep(0.5)
+
+    elapsed = time.time() - start
+    print(f"[RLM] Embedding completion finished: {total_embedded} chunks in {elapsed:.1f}s")
+
+    # Update final status
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        headers = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "Content-Type": "application/json",
+        }
+        await client.patch(
+            f"{SUPABASE_URL}/rest/v1/user_profiles",
+            params={"user_id": f"eq.{user_id}"},
+            headers=headers,
+            json={
+                "embedding_status": "complete",
+                "embedding_progress": 100,
+            },
+        )
+
+    # Alert on completion
+    await alert_drew(f"✅ Embeddings Complete\n\nUser: {user_id}\nChunks: {total_embedded}\nTime: {elapsed:.1f}s")
+
+
+@app.on_event("startup")
+async def startup_check_incomplete_embeddings():
+    """
+    On startup, check for any users with incomplete embeddings and queue them.
+    This ensures embeddings always get completed even if the server restarts.
+    """
+    # Wait for server to fully initialize
+    await asyncio.sleep(5)
+
+    print("[RLM] Checking for users with incomplete embeddings...")
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            headers = {
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            }
+
+            # Find users with import_status=complete but embedding_status != complete
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/user_profiles",
+                params={
+                    "import_status": "eq.complete",
+                    "embedding_status": "neq.complete",
+                    "select": "user_id",
+                    "limit": "10",  # Process up to 10 users
+                },
+                headers=headers,
+            )
+
+            if resp.status_code != 200:
+                print(f"[RLM] Failed to check incomplete embeddings: {resp.text[:200]}")
+                return
+
+            users = resp.json()
+            if not users:
+                print("[RLM] No users with incomplete embeddings")
+                return
+
+            print(f"[RLM] Found {len(users)} users with incomplete embeddings")
+
+            for user in users:
+                user_id = user.get("user_id")
+                if user_id:
+                    print(f"[RLM] Queuing embedding completion for {user_id}")
+                    asyncio.create_task(complete_embeddings_background(user_id))
+
+    except Exception as e:
+        print(f"[RLM] Error checking incomplete embeddings: {e}")
