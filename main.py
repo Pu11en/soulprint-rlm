@@ -50,6 +50,131 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ============================================================
+# JOB RECOVERY SYSTEM
+# ============================================================
+
+async def create_job(user_id: str, storage_path: str, conversation_count: int, message_count: int) -> str:
+    """Create a job record and return job_id."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        headers = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        }
+        resp = await client.post(
+            f"{SUPABASE_URL}/rest/v1/processing_jobs",
+            headers=headers,
+            json={
+                "user_id": user_id,
+                "status": "pending",
+                "storage_path": storage_path,
+                "conversation_count": conversation_count,
+                "message_count": message_count,
+                "current_step": "queued",
+                "progress": 0,
+                "attempts": 1,
+            },
+        )
+        if resp.status_code not in (200, 201):
+            print(f"[RLM] Failed to create job: {resp.status_code} - {resp.text[:200]}")
+            return None
+        jobs = resp.json()
+        return jobs[0]["id"] if jobs else None
+
+
+async def update_job(job_id: str, **kwargs):
+    """Update job status/progress."""
+    if not job_id:
+        return
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        headers = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "Content-Type": "application/json",
+        }
+        await client.patch(
+            f"{SUPABASE_URL}/rest/v1/processing_jobs",
+            params={"id": f"eq.{job_id}"},
+            headers=headers,
+            json=kwargs,
+        )
+
+
+async def complete_job(job_id: str, success: bool, error_message: str = None):
+    """Mark job as complete or failed."""
+    if not job_id:
+        return
+    status = "complete" if success else "failed"
+    update_data = {
+        "status": status,
+        "progress": 100 if success else None,
+        "completed_at": datetime.utcnow().isoformat(),
+    }
+    if error_message:
+        update_data["error_message"] = error_message
+    await update_job(job_id, **update_data)
+
+
+async def get_stuck_jobs() -> list:
+    """Find jobs that were interrupted (status = processing or pending with old updated_at)."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        headers = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        }
+        # Find jobs stuck in processing (server died) or pending (never started)
+        resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/processing_jobs",
+            params={
+                "status": "in.(pending,processing)",
+                "attempts": "lt.3",  # Max 3 retries
+                "select": "*",
+            },
+            headers=headers,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        return []
+
+
+async def resume_stuck_jobs():
+    """Check for and resume any stuck jobs on startup."""
+    print("[RLM] Checking for stuck jobs to resume...")
+    stuck_jobs = await get_stuck_jobs()
+
+    if not stuck_jobs:
+        print("[RLM] No stuck jobs found")
+        return
+
+    print(f"[RLM] Found {len(stuck_jobs)} stuck job(s), resuming...")
+
+    for job in stuck_jobs:
+        job_id = job["id"]
+        user_id = job["user_id"]
+        storage_path = job["storage_path"]
+        attempts = job.get("attempts", 0) + 1
+
+        print(f"[RLM] Resuming job {job_id} for user {user_id} (attempt {attempts})")
+
+        # Update attempt count
+        await update_job(job_id, attempts=attempts, status="processing", current_step="resuming")
+
+        # Start processing in background
+        asyncio.create_task(
+            process_full_background(user_id, storage_path, job_id=job_id)
+        )
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Run on server startup - check for stuck jobs."""
+    # Small delay to let server fully initialize
+    await asyncio.sleep(2)
+    await resume_stuck_jobs()
+
 # Config
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
@@ -1830,11 +1955,23 @@ async def process_full(request: ProcessFullRequest, background_tasks: Background
     Supports two modes:
     1. storage_path: RLM downloads parsed JSON from Supabase Storage (scalable, 10k+ convos)
     2. conversations: Legacy direct passing (for small imports only)
+
+    Jobs are tracked in processing_jobs table for recovery after server restarts.
     """
     print(f"[RLM] Received process-full request for user {request.user_id}")
 
+    job_id = None
     if request.storage_path:
         print(f"[RLM] Storage path: {request.storage_path} ({request.conversation_count} convos, {request.message_count} msgs)")
+        # Create job record for recovery
+        job_id = await create_job(
+            request.user_id,
+            request.storage_path,
+            request.conversation_count or 0,
+            request.message_count or 0,
+        )
+        if job_id:
+            print(f"[RLM] Created job {job_id}")
     elif request.conversations:
         print(f"[RLM] Direct conversations: {len(request.conversations)}")
     else:
@@ -1845,7 +1982,8 @@ async def process_full(request: ProcessFullRequest, background_tasks: Background
         process_full_background,
         request.user_id,
         request.storage_path,
-        request.conversations
+        request.conversations,
+        job_id,
     )
 
     return {
@@ -1853,6 +1991,7 @@ async def process_full(request: ProcessFullRequest, background_tasks: Background
         "message": "Full processing started: chunking → embedding → soulprint.",
         "user_id": request.user_id,
         "conversation_count": request.conversation_count,
+        "job_id": job_id,
     }
 
 
@@ -1880,7 +2019,7 @@ async def embed_chunks(request: EmbedChunksRequest, background_tasks: Background
     }
 
 
-async def process_full_background(user_id: str, storage_path: Optional[str], conversations: Optional[List[dict]] = None):
+async def process_full_background(user_id: str, storage_path: Optional[str], conversations: Optional[List[dict]] = None, job_id: Optional[str] = None):
     """
     Full background pipeline: Create chunks → Embed → Generate SoulPrint.
 
@@ -1892,11 +2031,16 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
     Supports:
     - storage_path: Download parsed JSON from Supabase Storage (scalable)
     - conversations: Direct list (legacy, for small imports)
+    - job_id: For progress tracking and recovery
     """
     start = time.time()
-    print(f"[RLM] Starting full processing for user {user_id}")
+    print(f"[RLM] Starting full processing for user {user_id}" + (f" (job {job_id})" if job_id else ""))
 
     try:
+        # Mark job as processing
+        if job_id:
+            await update_job(job_id, status="processing", current_step="starting", progress=0)
+
         async with httpx.AsyncClient(timeout=600.0) as client:
             headers = {
                 "apikey": SUPABASE_SERVICE_KEY,
@@ -1916,6 +2060,8 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
             # STEP 0: Get conversations (from storage or direct)
             # ============================================================
             if storage_path:
+                if job_id:
+                    await update_job(job_id, current_step="downloading", progress=5)
                 print(f"[RLM] Downloading parsed JSON from storage: {storage_path}")
                 # Parse bucket and path
                 path_parts = storage_path.split("/", 1)
@@ -1942,6 +2088,8 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
             # ============================================================
             # STEP 1: Parse raw ChatGPT format and create multi-tier chunks
             # ============================================================
+            if job_id:
+                await update_job(job_id, current_step="chunking", progress=15)
             print(f"[RLM] Parsing {len(conversations)} raw ChatGPT conversations...")
 
             all_chunks = []
@@ -2152,6 +2300,8 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
             # ============================================================
             # STEP 3: Embed all chunks (PARALLEL - balanced speed/cost)
             # ============================================================
+            if job_id:
+                await update_job(job_id, current_step="embedding", progress=35)
             print(f"[RLM] Embedding {inserted_count} chunks with Bedrock Titan (parallel)...")
 
             # Fetch chunks we just inserted
@@ -2210,6 +2360,8 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
             # ============================================================
             # STEP 4: Generate SoulPrint
             # ============================================================
+            if job_id:
+                await update_job(job_id, current_step="synthesizing", progress=75)
             await generate_soulprint_from_chunks(user_id, client, headers)
 
             # Final status update
@@ -2250,6 +2402,10 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
             except Exception as e:
                 print(f"[RLM] Vercel callback failed: {e}")
 
+            # Mark job complete
+            if job_id:
+                await complete_job(job_id, success=True)
+
             await alert_drew(
                 f"✅ Full Processing Complete!\n\n"
                 f"User: {user_id}\n"
@@ -2261,6 +2417,10 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
     except Exception as e:
         error_msg = str(e)
         print(f"[RLM] Full processing failed: {error_msg}")
+
+        # Mark job failed
+        if job_id:
+            await complete_job(job_id, success=False, error_message=error_msg[:500])
 
         try:
             async with httpx.AsyncClient() as client:
