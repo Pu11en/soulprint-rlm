@@ -584,6 +584,8 @@ async def search_memories(user_id: str, query: str, limit: int = 50) -> List[dic
                         r["match_type"] = "vector"
                     vector_results.extend(tier_results)
                     print(f"[RLM] Vector tier '{tier}' returned {len(tier_results)} matches")
+                else:
+                    print(f"[RLM] Vector tier '{tier}' FAILED: {response.status_code} - {response.text}")
 
             # Fallback to non-tier search if no results
             if not vector_results:
