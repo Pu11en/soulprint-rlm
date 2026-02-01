@@ -218,7 +218,10 @@ async def alert_drew(message: str):
 # ============================================================================
 
 async def search_memories(user_id: str, query: str, limit: int = 50) -> List[dict]:
-    """Search conversation_chunks by vector similarity using Bedrock Titan embeddings"""
+    """
+    Search conversation_chunks by vector similarity using Bedrock Titan embeddings.
+    Uses tier-aware search: macro (themes) → medium (context) → micro (facts)
+    """
 
     # Generate query embedding with Bedrock Titan
     query_embedding = await embed_text_bedrock(query)
@@ -226,31 +229,66 @@ async def search_memories(user_id: str, query: str, limit: int = 50) -> List[dic
         print("[RLM] Failed to generate query embedding, using fallback")
         return await get_recent_chunks(user_id, limit)
 
+    all_memories = []
+
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{SUPABASE_URL}/rest/v1/rpc/match_conversation_chunks",
-                headers={
-                    "apikey": SUPABASE_SERVICE_KEY,
-                    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "query_embedding": query_embedding,
-                    "match_user_id": user_id,
-                    "match_count": limit,
-                    "match_threshold": 0.3,
-                },
-                timeout=30.0,
-            )
+            headers = {
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                "Content-Type": "application/json",
+            }
 
-            if response.status_code == 200:
-                memories = response.json()
-                print(f"[RLM] Vector search returned {len(memories)} memories from conversation_chunks")
-                return memories
-            else:
-                print(f"[RLM] Vector search error: {response.status_code} - {response.text}")
-                return await get_recent_chunks(user_id, limit)
+            # Search each tier with different limits
+            # Macro: themes/relationships (few, high context)
+            # Medium: conversation context (moderate)
+            # Micro: precise facts (many, pinpoint accuracy)
+            tier_limits = [
+                ("macro", 10),   # Broad themes
+                ("medium", 20),  # Conversation context
+                ("micro", 20),   # Precise facts
+            ]
+
+            for tier, tier_limit in tier_limits:
+                response = await client.post(
+                    f"{SUPABASE_URL}/rest/v1/rpc/match_conversation_chunks_by_tier",
+                    headers=headers,
+                    json={
+                        "query_embedding": query_embedding,
+                        "match_user_id": user_id,
+                        "match_tier": tier,
+                        "match_count": tier_limit,
+                        "match_threshold": 0.3,
+                    },
+                    timeout=30.0,
+                )
+
+                if response.status_code == 200:
+                    tier_results = response.json()
+                    for r in tier_results:
+                        r["chunk_tier"] = tier  # Tag with tier
+                    all_memories.extend(tier_results)
+                    print(f"[RLM] Tier '{tier}' returned {len(tier_results)} matches")
+
+            # Fallback to non-tier search if no results or function doesn't exist
+            if not all_memories:
+                response = await client.post(
+                    f"{SUPABASE_URL}/rest/v1/rpc/match_conversation_chunks",
+                    headers=headers,
+                    json={
+                        "query_embedding": query_embedding,
+                        "match_user_id": user_id,
+                        "match_count": limit,
+                        "match_threshold": 0.3,
+                    },
+                    timeout=30.0,
+                )
+                if response.status_code == 200:
+                    all_memories = response.json()
+
+            print(f"[RLM] Total memories retrieved: {len(all_memories)}")
+            return all_memories[:limit]
+
     except Exception as e:
         print(f"[RLM] Vector search exception: {e}")
         return await get_recent_chunks(user_id, limit)
