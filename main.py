@@ -393,29 +393,42 @@ async def bedrock_claude_message(
     if system:
         request_body["system"] = [{"text": system}]
 
-    try:
-        # Use run_in_executor to call sync boto3 in async context
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: bedrock_client.converse(**request_body)
-        )
+    # Retry with exponential backoff for throttling
+    max_retries = 5
+    base_delay = 2
 
-        # Extract text from response
-        output = response.get("output", {})
-        message = output.get("message", {})
-        content = message.get("content", [])
+    for attempt in range(max_retries):
+        try:
+            # Use run_in_executor to call sync boto3 in async context
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: bedrock_client.converse(**request_body)
+            )
 
-        text_parts = []
-        for block in content:
-            if "text" in block:
-                text_parts.append(block["text"])
+            # Extract text from response
+            output = response.get("output", {})
+            message = output.get("message", {})
+            content = message.get("content", [])
 
-        return "".join(text_parts)
+            text_parts = []
+            for block in content:
+                if "text" in block:
+                    text_parts.append(block["text"])
 
-    except Exception as e:
-        print(f"[RLM] Bedrock Claude error: {e}")
-        raise
+            return "".join(text_parts)
+
+        except Exception as e:
+            error_str = str(e)
+            is_throttle = "ThrottlingException" in error_str or "Too many requests" in error_str
+
+            if is_throttle and attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)  # 2, 4, 8, 16, 32 seconds
+                print(f"[RLM] Bedrock throttled, waiting {delay}s before retry {attempt + 2}/{max_retries}")
+                await asyncio.sleep(delay)
+            else:
+                print(f"[RLM] Bedrock Claude error: {e}")
+                raise
 
 
 # ============================================================================
@@ -1084,7 +1097,7 @@ async def recursive_synthesize(messages: List[dict], user_id: str, batch_size: i
         print(f"[RLM] Haiku processing batch {i+1}/{len(batches)}")
         summary = await haiku_extract_patterns(batch, i, len(batches))
         summaries.append(summary)
-        await asyncio.sleep(0.3)  # Rate limit
+        await asyncio.sleep(1.5)  # Rate limit - longer delay to avoid throttling
 
     # Level 2+: Recursive merge with Sonnet
     print(f"[RLM] Level 2: Merging {len(summaries)} summaries")
@@ -2744,7 +2757,9 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
                 except Exception as sp_error:
                     print(f"[RLM] SoulPrint attempt {attempt + 1} failed: {sp_error}")
                     if attempt < 2:
-                        await asyncio.sleep(3)
+                        delay = 10 * (attempt + 1)  # 10s, 20s
+                        print(f"[RLM] Waiting {delay}s before retry...")
+                        await asyncio.sleep(delay)
 
             if not soulprint_success:
                 raise Exception("SoulPrint generation failed after 3 attempts")
