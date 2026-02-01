@@ -997,6 +997,94 @@ Keep it under 1000 words. Stick to facts from the analysis."""
     }
 
 
+async def generate_memory_log(messages: List[dict], profile: dict, user_id: str) -> str:
+    """
+    Generate a memory log summarizing the user's conversation history.
+    This creates a daily summary style log.
+    """
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    # Group messages by date
+    messages_by_date = {}
+    for msg in messages:
+        timestamp = msg.get("original_timestamp")
+        if timestamp:
+            try:
+                if isinstance(timestamp, str):
+                    # Parse ISO format
+                    msg_date = timestamp[:10]  # YYYY-MM-DD
+                else:
+                    msg_date = str(date.today())
+            except:
+                msg_date = str(date.today())
+        else:
+            msg_date = str(date.today())
+
+        if msg_date not in messages_by_date:
+            messages_by_date[msg_date] = []
+        messages_by_date[msg_date].append(msg)
+
+    # Get recent dates (last 7 days worth of data or less)
+    sorted_dates = sorted(messages_by_date.keys(), reverse=True)[:7]
+
+    if not sorted_dates:
+        return f"# Memory Log - {date.today()}\n\nNo conversations to summarize yet."
+
+    # Build summary text
+    summary_input = ""
+    for d in sorted_dates:
+        day_messages = messages_by_date[d][:20]  # Limit per day
+        summary_input += f"\n## {d}\n"
+        for msg in day_messages:
+            title = msg.get("conversation_title", "")
+            content = msg.get("content", "")[:200]
+            summary_input += f"- [{title}] {content}\n"
+
+    prompt = f"""Based on this user's recent conversations, create a memory log summary.
+
+## USER PROFILE
+Archetype: {profile.get('archetype', 'Unknown')}
+Core: {profile.get('core_essence', '')}
+
+## RECENT CONVERSATIONS
+{summary_input[:15000]}
+
+## TASK
+Create a memory log in markdown format:
+
+# Memory Log - {date.today()}
+
+## Summary
+[2-3 sentences summarizing their recent activity and interests]
+
+## Key Topics
+- [Topic 1]
+- [Topic 2]
+- [Topic 3]
+
+## Notable Details
+- [Any important facts, projects, or events mentioned]
+
+## Current Focus
+[What they seem to be working on or thinking about]
+
+## Emotional State
+[General mood/energy based on conversations]
+
+Keep it concise but informative. This will help the AI remember context."""
+
+    try:
+        response = client.messages.create(
+            model=HAIKU_MODEL,  # Use Haiku for speed
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.content[0].text
+    except Exception as e:
+        print(f"[RLM] Memory log error: {e}")
+        return f"# Memory Log - {date.today()}\n\nFailed to generate: {e}"
+
+
 @app.post("/process-import")
 async def process_import(request: ProcessImportRequest, background_tasks: BackgroundTasks):
     """
@@ -1371,7 +1459,17 @@ Return ONLY valid JSON, no markdown."""
 
 @app.post("/create-soulprint")
 async def create_soulprint(request: CreateSoulprintRequest):
-    """EXHAUSTIVE soulprint generation (legacy endpoint)"""
+    """
+    EXHAUSTIVE soulprint generation with full SoulPrint files.
+
+    Returns:
+    - soulprint: JSON profile with archetype, core_essence, voice, mind, heart, world
+    - soul_md: SOUL.md content
+    - identity_md: IDENTITY.md content
+    - agents_md: AGENTS.md content
+    - user_md: USER.md content
+    - memory_log: Today's memory log
+    """
     try:
         conversations = request.conversations
         stats = request.stats or {}
@@ -1382,29 +1480,74 @@ async def create_soulprint(request: CreateSoulprintRequest):
 
         print(f"[RLM] EXHAUSTIVE soulprint for user {user_id} from {len(conversations)} conversations")
 
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
         # Convert conversations to message format
         messages = []
         for conv in conversations:
             title = conv.get("title", "Untitled")
+            created_at = conv.get("createdAt") or conv.get("created_at")
             conv_messages = conv.get("messages", [])
             for m in conv_messages:
                 if isinstance(m, dict) and m.get("role") == "user":
                     messages.append({
                         "content": m.get("content", ""),
                         "conversation_title": title,
+                        "original_timestamp": created_at,
                     })
 
-        # Run recursive synthesis
-        result = await recursive_synthesize(messages[:5000], user_id)
+        # Run recursive synthesis to get personality profile
+        print(f"[RLM] Running recursive synthesis on {len(messages)} messages...")
+        profile = await recursive_synthesize(messages[:5000], user_id)
+        archetype = profile.get("archetype", "Unique Individual")
 
-        soulprint_data = result
-        archetype = result.get("archetype", "Unique Individual")
+        # Generate the 4 SoulPrint markdown files
+        print("[RLM] Generating SoulPrint files (SOUL.md, IDENTITY.md, AGENTS.md, USER.md)...")
+        soul_files = await generate_soulprint_files(profile, messages, user_id)
+
+        # Generate today's memory log
+        print("[RLM] Generating memory log...")
+        memory_log = await generate_memory_log(messages, profile, user_id)
+
+        # Save to Supabase if configured
+        if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+            print("[RLM] Saving SoulPrint to Supabase...")
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    headers = {
+                        "apikey": SUPABASE_SERVICE_KEY,
+                        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                        "Content-Type": "application/json",
+                        "Prefer": "resolution=merge-duplicates",
+                    }
+
+                    # Update user_profiles with full soulprint data
+                    await client.post(
+                        f"{SUPABASE_URL}/rest/v1/user_profiles",
+                        headers=headers,
+                        json={
+                            "user_id": user_id,
+                            "soulprint": profile,
+                            "soulprint_text": profile.get("core_essence", archetype),
+                            "archetype": archetype,
+                            "soul_md": soul_files.get("soul_md"),
+                            "identity_md": soul_files.get("identity_md"),
+                            "agents_md": soul_files.get("agents_md"),
+                            "user_md": soul_files.get("user_md"),
+                            "soulprint_generated_at": datetime.utcnow().isoformat(),
+                            "updated_at": datetime.utcnow().isoformat(),
+                        },
+                    )
+                    print(f"[RLM] SoulPrint saved for user {user_id}")
+            except Exception as e:
+                print(f"[RLM] Failed to save to Supabase: {e}")
 
         return {
-            "soulprint": soulprint_data,
+            "soulprint": profile,
             "archetype": archetype,
+            "soul_md": soul_files.get("soul_md"),
+            "identity_md": soul_files.get("identity_md"),
+            "agents_md": soul_files.get("agents_md"),
+            "user_md": soul_files.get("user_md"),
+            "memory_log": memory_log,
             "conversations_analyzed": len(conversations),
         }
 
