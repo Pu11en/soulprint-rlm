@@ -15,7 +15,7 @@ import time
 import asyncio
 import anthropic
 from datetime import datetime, date
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -1964,14 +1964,46 @@ async def test_patch():
                 )
 
 
-def detect_query_intent(message: str) -> str:
+def detect_query_intent(message: str, history: list = None) -> Tuple[str, Optional[str]]:
     """
     Smart routing - detect what kind of response the user wants:
     - 'memory': User explicitly asking about their past/history
+    - 'memory_accept': User accepting a memory offer from previous message
     - 'realtime': User asking about current events, prices, news
     - 'normal': General question - answer directly, offer memory if relevant
+
+    Returns: (intent, topic_override) - topic_override is set when accepting memory offer
     """
     msg_lower = message.lower()
+    history = history or []
+
+    # Check if user is ACCEPTING a memory offer
+    # Look for short affirmative responses that indicate "yes show me"
+    accept_triggers = [
+        'yes', 'yeah', 'yep', 'sure', 'ok', 'okay', 'please', 'pls',
+        'show me', 'tell me', 'go ahead', 'do it', 'yes please', 'yes pls',
+        'yea', 'ya', 'yup', 'uh huh', 'absolutely', 'definitely',
+    ]
+
+    # Only check for acceptance if message is short (likely a response)
+    if len(msg_lower.split()) <= 5:
+        is_acceptance = any(trigger in msg_lower for trigger in accept_triggers)
+
+        if is_acceptance and history:
+            # Find last assistant message and check for memory offer
+            for msg in reversed(history):
+                if msg.get('role') == 'assistant':
+                    content = msg.get('content', '')
+                    # Check if it had the memory offer format
+                    if '💭' in content and 'past conversations about' in content:
+                        # Extract the topic from the memory offer
+                        # Format: "I found X past conversations about TOPIC - want me..."
+                        match = re.search(r'past conversations about ([^-]+)', content)
+                        if match:
+                            topic = match.group(1).strip()
+                            print(f"[RLM] Memory offer accepted! Topic: '{topic}'")
+                            return ('memory_accept', topic)
+                    break
 
     # MEMORY MODE - user explicitly asking about their past
     memory_triggers = [
@@ -1984,7 +2016,7 @@ def detect_query_intent(message: str) -> str:
         'based on what i said', 'according to my history',
     ]
     if any(trigger in msg_lower for trigger in memory_triggers):
-        return 'memory'
+        return ('memory', None)
 
     # REALTIME MODE - user asking about current/live data
     realtime_triggers = [
@@ -1995,10 +2027,10 @@ def detect_query_intent(message: str) -> str:
         'score', 'game score', 'who won',
     ]
     if any(trigger in msg_lower for trigger in realtime_triggers):
-        return 'realtime'
+        return ('realtime', None)
 
     # Default to normal mode
-    return 'normal'
+    return ('normal', None)
 
 
 @app.post("/query", response_model=QueryResponse)
@@ -2014,9 +2046,9 @@ async def query(request: QueryRequest):
         )
 
     try:
-        # SMART ROUTING - detect what the user wants
-        intent = detect_query_intent(request.message)
-        print(f"[RLM] Query intent: {intent} | Message: '{request.message[:50]}...'")
+        # SMART ROUTING - detect what the user wants (now context-aware)
+        intent, topic_override = detect_query_intent(request.message, request.history)
+        print(f"[RLM] Query intent: {intent} | Topic override: {topic_override} | Message: '{request.message[:50]}...'")
 
         # Get soulprint for personality context (always useful)
         soulprint_data = await get_soulprint(request.user_id)
@@ -2025,18 +2057,23 @@ async def query(request: QueryRequest):
         chunks = []
         memory_offer = ""
 
-        if intent == 'memory':
+        if intent == 'memory' or intent == 'memory_accept':
             # MEMORY MODE - Deep dive into their history
-            chunks = await search_memories(request.user_id, request.message, limit=50)
+            # Use topic_override if accepting an offer, otherwise use the message
+            search_query = topic_override if topic_override else request.message
+            chunks = await search_memories(request.user_id, search_query, limit=50)
             context = build_context(chunks, soulprint, request.history or [])
             limited_context = context[:25000] if len(context) > 25000 else context
+
+            # Customize the prompt based on whether it's an offer acceptance
+            intro = f"The user accepted your offer to show their past conversations about '{topic_override}'." if intent == 'memory_accept' else "The user wants to know what they said/discussed before."
 
             system_prompt = f"""You are SoulPrint, a personal AI with TOTAL RECALL of the user's conversation history.
 
 {limited_context}
 
-## MEMORY MODE - User is asking about their past
-The user wants to know what they said/discussed before. Your job:
+## MEMORY MODE - {intro}
+Your job:
 1. **Quote their actual words** - Use exact quotes from the conversation history above
 2. **Be specific with dates/context** - "On [date], you said '...'" or "In a conversation about [topic], you mentioned..."
 3. **Summarize patterns** - If they discussed something multiple times, note that
