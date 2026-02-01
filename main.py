@@ -1701,6 +1701,7 @@ async def test_patch():
                     "title": "Test Chunk",
                     "content": "This is a test chunk for verifying the embedding PATCH flow works correctly.",
                     "chunk_tier": "micro",
+                    "created_at": datetime.now().isoformat(),
                 },
             )
             if insert_resp.status_code not in (200, 201):
