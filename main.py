@@ -1593,6 +1593,545 @@ async def create_soulprint(request: CreateSoulprintRequest):
         raise HTTPException(status_code=500, detail=f"Soulprint creation failed: {error_msg}")
 
 
+class ProcessFullRequest(BaseModel):
+    user_id: str
+    conversations: Optional[List[dict]] = None  # Parsed conversations from Vercel
+
+
+@app.post("/process-full")
+async def process_full(request: ProcessFullRequest, background_tasks: BackgroundTasks):
+    """
+    Full processing pipeline: Create chunks → Embed → Generate SoulPrint.
+    Called by Vercel after parsing ZIP. Runs in background - no timeout.
+    """
+    print(f"[RLM] Received process-full request for user {request.user_id}")
+    print(f"[RLM] Conversations received: {len(request.conversations) if request.conversations else 0}")
+
+    # Start background processing
+    background_tasks.add_task(
+        process_full_background,
+        request.user_id,
+        request.conversations
+    )
+
+    return {
+        "status": "processing",
+        "message": "Full processing started: chunking → embedding → soulprint.",
+        "user_id": request.user_id,
+    }
+
+
+class EmbedChunksRequest(BaseModel):
+    user_id: str
+
+
+@app.post("/embed-chunks")
+async def embed_chunks(request: EmbedChunksRequest, background_tasks: BackgroundTasks):
+    """
+    Embed existing chunks for a user using Bedrock Titan.
+    Use /process-full for full pipeline instead.
+    """
+    print(f"[RLM] Received embed-chunks request for user {request.user_id}")
+
+    background_tasks.add_task(
+        embed_chunks_background,
+        request.user_id
+    )
+
+    return {
+        "status": "processing",
+        "message": "Embedding started. SoulPrint will be generated after.",
+        "user_id": request.user_id,
+    }
+
+
+async def process_full_background(user_id: str, conversations: Optional[List[dict]]):
+    """
+    Full background pipeline: Create chunks → Embed → Generate SoulPrint.
+
+    Multi-tier chunking:
+    - micro: 200 chars (precise facts, names, dates)
+    - medium: 2000 chars (conversation context)
+    - macro: 5000 chars (themes, relationships)
+    """
+    start = time.time()
+    print(f"[RLM] Starting full processing for user {user_id}")
+
+    try:
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            headers = {
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                "Content-Type": "application/json",
+            }
+
+            # Update status
+            await client.patch(
+                f"{SUPABASE_URL}/rest/v1/user_profiles",
+                params={"user_id": f"eq.{user_id}"},
+                headers=headers,
+                json={"import_status": "processing", "embedding_status": "pending"},
+            )
+
+            if not conversations:
+                print(f"[RLM] No conversations provided, checking existing chunks...")
+                await embed_chunks_background(user_id)
+                return
+
+            # ============================================================
+            # STEP 1: Create multi-tier chunks
+            # ============================================================
+            print(f"[RLM] Creating multi-tier chunks from {len(conversations)} conversations...")
+
+            all_chunks = []
+            total_messages = 0
+
+            for idx, conv in enumerate(conversations[:500]):  # Limit to 500 conversations
+                title = conv.get("title", "Untitled")
+                messages = conv.get("messages", [])
+                created_at = conv.get("createdAt") or conv.get("created_at") or datetime.utcnow().isoformat()
+
+                # Build full content from messages
+                full_content = ""
+                for m in messages[:30]:  # Max 30 messages per conversation
+                    if isinstance(m, dict):
+                        role = m.get("role", "user")
+                        content = m.get("content", "")
+                        if content:
+                            full_content += f"{role}: {content}\n"
+                            total_messages += 1
+
+                if not full_content.strip():
+                    continue
+
+                is_recent = idx < 100
+
+                # MICRO chunks (200 chars) - precise facts
+                MICRO_SIZE = 200
+                for i in range(0, min(len(full_content), 2000), MICRO_SIZE):
+                    chunk_text = full_content[i:i + MICRO_SIZE].strip()
+                    if len(chunk_text) > 50:
+                        all_chunks.append({
+                            "user_id": user_id,
+                            "conversation_id": conv.get("id", f"conv_{idx}"),
+                            "title": title,
+                            "content": chunk_text,
+                            "chunk_tier": "micro",
+                            "message_count": len(messages),
+                            "created_at": created_at,
+                            "is_recent": is_recent,
+                        })
+
+                # MEDIUM chunk (2000 chars) - conversation context
+                medium_content = full_content[:2000].strip()
+                if len(medium_content) > 100:
+                    all_chunks.append({
+                        "user_id": user_id,
+                        "conversation_id": conv.get("id", f"conv_{idx}"),
+                        "title": title,
+                        "content": medium_content,
+                        "chunk_tier": "medium",
+                        "message_count": len(messages),
+                        "created_at": created_at,
+                        "is_recent": is_recent,
+                    })
+
+                # MACRO chunk (5000 chars) - themes, relationships
+                macro_content = full_content[:5000].strip()
+                if len(macro_content) > 500:
+                    all_chunks.append({
+                        "user_id": user_id,
+                        "conversation_id": conv.get("id", f"conv_{idx}"),
+                        "title": title,
+                        "content": macro_content,
+                        "chunk_tier": "macro",
+                        "message_count": len(messages),
+                        "created_at": created_at,
+                        "is_recent": is_recent,
+                    })
+
+            # Limit chunks: prioritize macro + medium + recent micro
+            macro_chunks = [c for c in all_chunks if c["chunk_tier"] == "macro"]
+            medium_chunks = [c for c in all_chunks if c["chunk_tier"] == "medium"]
+            micro_chunks = [c for c in all_chunks if c["chunk_tier"] == "micro" and c.get("is_recent")][:300]
+
+            chunks_to_insert = macro_chunks + medium_chunks + micro_chunks
+
+            tier_counts = {
+                "macro": len(macro_chunks),
+                "medium": len(medium_chunks),
+                "micro": len(micro_chunks),
+            }
+            print(f"[RLM] Created {len(chunks_to_insert)} chunks: {tier_counts}")
+
+            # ============================================================
+            # STEP 2: Insert chunks into Supabase
+            # ============================================================
+            print(f"[RLM] Inserting chunks into Supabase...")
+
+            # Clear existing chunks for this user first
+            await client.delete(
+                f"{SUPABASE_URL}/rest/v1/conversation_chunks",
+                params={"user_id": f"eq.{user_id}"},
+                headers=headers,
+            )
+
+            # Insert in batches
+            BATCH_SIZE = 100
+            inserted_count = 0
+            for i in range(0, len(chunks_to_insert), BATCH_SIZE):
+                batch = chunks_to_insert[i:i + BATCH_SIZE]
+                # Remove is_recent before inserting (not a DB column)
+                for c in batch:
+                    c.pop("is_recent", None)
+
+                resp = await client.post(
+                    f"{SUPABASE_URL}/rest/v1/conversation_chunks",
+                    headers=headers,
+                    json=batch,
+                )
+                if resp.status_code in [200, 201]:
+                    inserted_count += len(batch)
+                else:
+                    print(f"[RLM] Chunk insert error: {resp.text[:200]}")
+
+            print(f"[RLM] Inserted {inserted_count} chunks")
+
+            # Update profile with chunk counts
+            await client.patch(
+                f"{SUPABASE_URL}/rest/v1/user_profiles",
+                params={"user_id": f"eq.{user_id}"},
+                headers=headers,
+                json={
+                    "total_chunks": inserted_count,
+                    "total_messages": total_messages,
+                    "embedding_status": "processing",
+                },
+            )
+
+            # ============================================================
+            # STEP 3: Embed all chunks
+            # ============================================================
+            print(f"[RLM] Embedding {inserted_count} chunks with Bedrock Titan...")
+
+            # Fetch chunks we just inserted
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/conversation_chunks",
+                params={
+                    "user_id": f"eq.{user_id}",
+                    "select": "id,content",
+                    "limit": "5000",
+                },
+                headers=headers,
+            )
+            chunks_to_embed = resp.json() if resp.status_code == 200 else []
+
+            bedrock_client = get_bedrock_client()
+            embedded_count = 0
+
+            for i, chunk in enumerate(chunks_to_embed):
+                try:
+                    embedding = await embed_text_bedrock(chunk["content"], bedrock_client)
+                    if embedding:
+                        await client.patch(
+                            f"{SUPABASE_URL}/rest/v1/conversation_chunks",
+                            params={"id": f"eq.{chunk['id']}"},
+                            headers=headers,
+                            json={"embedding": embedding},
+                        )
+                        embedded_count += 1
+
+                    # Progress update every 50
+                    if i % 50 == 0:
+                        progress = int((i + 1) / len(chunks_to_embed) * 100)
+                        await client.patch(
+                            f"{SUPABASE_URL}/rest/v1/user_profiles",
+                            params={"user_id": f"eq.{user_id}"},
+                            headers=headers,
+                            json={"embedding_progress": progress, "processed_chunks": embedded_count},
+                        )
+                        print(f"[RLM] Embedding progress: {progress}% ({embedded_count}/{len(chunks_to_embed)})")
+
+                    await asyncio.sleep(0.05)  # Rate limit
+
+                except Exception as e:
+                    print(f"[RLM] Embed error for chunk {chunk['id']}: {e}")
+
+            print(f"[RLM] Embedded {embedded_count}/{len(chunks_to_embed)} chunks")
+
+            # ============================================================
+            # STEP 4: Generate SoulPrint
+            # ============================================================
+            await generate_soulprint_from_chunks(user_id, client, headers)
+
+            # Final status update
+            elapsed = time.time() - start
+            await client.patch(
+                f"{SUPABASE_URL}/rest/v1/user_profiles",
+                params={"user_id": f"eq.{user_id}"},
+                headers=headers,
+                json={
+                    "import_status": "complete",
+                    "embedding_status": "complete",
+                    "embedding_progress": 100,
+                    "processed_chunks": embedded_count,
+                },
+            )
+
+            print(f"[RLM] Full processing complete in {elapsed:.1f}s")
+            await alert_drew(
+                f"✅ Full Processing Complete!\n\n"
+                f"User: {user_id}\n"
+                f"Chunks: {tier_counts}\n"
+                f"Embedded: {embedded_count}\n"
+                f"Time: {elapsed:.1f}s"
+            )
+
+    except Exception as e:
+        error_msg = str(e)
+        print(f"[RLM] Full processing failed: {error_msg}")
+
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.patch(
+                    f"{SUPABASE_URL}/rest/v1/user_profiles",
+                    params={"user_id": f"eq.{user_id}"},
+                    headers={
+                        "apikey": SUPABASE_SERVICE_KEY,
+                        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"import_status": "failed", "import_error": error_msg[:500]},
+                )
+        except:
+            pass
+
+        await alert_drew(f"❌ Full Processing Failed\n\nUser: {user_id}\nError: {error_msg[:500]}")
+
+
+async def embed_chunks_background(user_id: str):
+    """
+    Background job to embed existing chunks for a user.
+    Use process_full_background for full pipeline.
+
+    Flow:
+    1. Fetch all chunks without embeddings
+    2. Embed with Bedrock Titan v2
+    3. Update chunks in Supabase
+    4. Generate SoulPrint
+    5. Update user_profiles status
+    """
+    start = time.time()
+    print(f"[RLM] Starting chunk embedding for user {user_id}")
+
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            headers = {
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                "Content-Type": "application/json",
+            }
+
+            # Update status to processing
+            await client.patch(
+                f"{SUPABASE_URL}/rest/v1/user_profiles",
+                params={"user_id": f"eq.{user_id}"},
+                headers=headers,
+                json={"embedding_status": "processing"},
+            )
+
+            # Fetch all chunks without embeddings
+            response = await client.get(
+                f"{SUPABASE_URL}/rest/v1/conversation_chunks",
+                params={
+                    "user_id": f"eq.{user_id}",
+                    "embedding": "is.null",
+                    "select": "id,content,chunk_tier",
+                    "limit": "5000",
+                },
+                headers=headers,
+            )
+
+            if response.status_code != 200:
+                raise Exception(f"Failed to fetch chunks: {response.text}")
+
+            chunks = response.json()
+            total_chunks = len(chunks)
+            print(f"[RLM] Found {total_chunks} chunks to embed")
+
+            if total_chunks == 0:
+                print(f"[RLM] No chunks to embed, generating soulprint...")
+                await generate_soulprint_from_chunks(user_id, client, headers)
+                return
+
+            # Embed in batches
+            BATCH_SIZE = 20
+            embedded_count = 0
+            failed_count = 0
+            bedrock_client = get_bedrock_client()
+
+            for i in range(0, total_chunks, BATCH_SIZE):
+                batch = chunks[i:i+BATCH_SIZE]
+                print(f"[RLM] Embedding batch {i//BATCH_SIZE + 1}/{(total_chunks + BATCH_SIZE - 1)//BATCH_SIZE}")
+
+                for chunk in batch:
+                    try:
+                        embedding = await embed_text_bedrock(chunk["content"], bedrock_client)
+
+                        if embedding:
+                            # Update chunk with embedding
+                            update_resp = await client.patch(
+                                f"{SUPABASE_URL}/rest/v1/conversation_chunks",
+                                params={"id": f"eq.{chunk['id']}"},
+                                headers=headers,
+                                json={"embedding": embedding},
+                            )
+
+                            if update_resp.status_code in [200, 204]:
+                                embedded_count += 1
+                            else:
+                                failed_count += 1
+                                print(f"[RLM] Failed to update chunk {chunk['id']}: {update_resp.text}")
+                        else:
+                            failed_count += 1
+
+                        await asyncio.sleep(0.05)  # Rate limit
+
+                    except Exception as e:
+                        failed_count += 1
+                        print(f"[RLM] Chunk embedding error: {e}")
+
+                # Update progress
+                progress = int((i + len(batch)) / total_chunks * 100)
+                await client.patch(
+                    f"{SUPABASE_URL}/rest/v1/user_profiles",
+                    params={"user_id": f"eq.{user_id}"},
+                    headers=headers,
+                    json={
+                        "embedding_progress": progress,
+                        "processed_chunks": embedded_count,
+                    },
+                )
+
+                await asyncio.sleep(0.2)  # Batch delay
+
+            elapsed = time.time() - start
+            print(f"[RLM] Embedded {embedded_count}/{total_chunks} chunks in {elapsed:.1f}s")
+
+            # Generate SoulPrint now that embeddings are done
+            await generate_soulprint_from_chunks(user_id, client, headers)
+
+            # Update final status
+            await client.patch(
+                f"{SUPABASE_URL}/rest/v1/user_profiles",
+                params={"user_id": f"eq.{user_id}"},
+                headers=headers,
+                json={
+                    "embedding_status": "complete",
+                    "embedding_progress": 100,
+                    "import_status": "complete",
+                    "total_chunks": total_chunks,
+                    "processed_chunks": embedded_count,
+                },
+            )
+
+            await alert_drew(
+                f"✅ Embeddings Complete!\n\n"
+                f"User: {user_id}\n"
+                f"Chunks: {embedded_count}/{total_chunks}\n"
+                f"Time: {elapsed:.1f}s"
+            )
+
+    except Exception as e:
+        error_msg = str(e)
+        print(f"[RLM] Embedding failed: {error_msg}")
+
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.patch(
+                    f"{SUPABASE_URL}/rest/v1/user_profiles",
+                    params={"user_id": f"eq.{user_id}"},
+                    headers={
+                        "apikey": SUPABASE_SERVICE_KEY,
+                        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "embedding_status": "failed",
+                        "import_error": error_msg[:500],
+                    },
+                )
+        except:
+            pass
+
+        await alert_drew(f"❌ Embedding Failed\n\nUser: {user_id}\nError: {error_msg[:500]}")
+
+
+async def generate_soulprint_from_chunks(user_id: str, client: httpx.AsyncClient, headers: dict):
+    """Generate SoulPrint from existing chunks"""
+    print(f"[RLM] Generating SoulPrint from chunks for user {user_id}")
+
+    # Fetch chunks for soulprint generation (prefer macro for themes)
+    response = await client.get(
+        f"{SUPABASE_URL}/rest/v1/conversation_chunks",
+        params={
+            "user_id": f"eq.{user_id}",
+            "select": "content,title,chunk_tier,created_at",
+            "order": "created_at.desc",
+            "limit": "500",
+        },
+        headers=headers,
+    )
+
+    if response.status_code != 200:
+        print(f"[RLM] Failed to fetch chunks for soulprint: {response.text}")
+        return
+
+    chunks = response.json()
+    if not chunks:
+        print(f"[RLM] No chunks found for soulprint generation")
+        return
+
+    # Convert chunks to message format for synthesis
+    messages = []
+    for chunk in chunks:
+        messages.append({
+            "content": chunk.get("content", ""),
+            "conversation_title": chunk.get("title", ""),
+            "original_timestamp": chunk.get("created_at"),
+        })
+
+    print(f"[RLM] Running synthesis on {len(messages)} chunks...")
+    profile = await recursive_synthesize(messages, user_id)
+    archetype = profile.get("archetype", "Unique Individual")
+
+    print("[RLM] Generating SoulPrint files...")
+    soul_files = await generate_soulprint_files(profile, messages, user_id)
+
+    print("[RLM] Generating memory log...")
+    memory_log = await generate_memory_log(messages, profile, user_id)
+
+    # Save to user_profiles
+    await client.patch(
+        f"{SUPABASE_URL}/rest/v1/user_profiles",
+        params={"user_id": f"eq.{user_id}"},
+        headers=headers,
+        json={
+            "soulprint": profile,
+            "soulprint_text": profile.get("core_essence", archetype),
+            "archetype": archetype,
+            "soul_md": soul_files.get("soul_md"),
+            "identity_md": soul_files.get("identity_md"),
+            "agents_md": soul_files.get("agents_md"),
+            "user_md": soul_files.get("user_md"),
+            "memory_log": memory_log,
+            "soulprint_generated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    print(f"[RLM] SoulPrint generated and saved for user {user_id}")
+
+
 @app.get("/status")
 async def status():
     """Detailed status for monitoring"""
