@@ -2821,6 +2821,12 @@ async def generate_soulprint_from_chunks(user_id: str, client: httpx.AsyncClient
     print(f"[RLM] Running synthesis on {len(messages)} chunks...")
     profile = await recursive_synthesize(messages, user_id)
     archetype = profile.get("archetype", "Unique Individual")
+    core_essence = profile.get("core_essence", archetype)
+
+    # Log what we got from synthesis
+    print(f"[RLM] Synthesis result - archetype: {archetype}, has_error: {'error' in profile}")
+    if "error" in profile:
+        print(f"[RLM] Synthesis error: {profile.get('error')}")
 
     print("[RLM] Generating SoulPrint files...")
     soul_files = await generate_soulprint_files(profile, messages, user_id)
@@ -2828,14 +2834,17 @@ async def generate_soulprint_from_chunks(user_id: str, client: httpx.AsyncClient
     print("[RLM] Generating memory log...")
     memory_log = await generate_memory_log(messages, profile, user_id)
 
-    # Save to user_profiles
-    await client.patch(
-        f"{SUPABASE_URL}/rest/v1/user_profiles",
-        params={"user_id": f"eq.{user_id}"},
-        headers=headers,
-        json={
+    # Save to user_profiles with fresh client to avoid connection issues
+    async with httpx.AsyncClient(timeout=60.0) as save_client:
+        save_headers = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        }
+        save_data = {
             "soulprint": profile,
-            "soulprint_text": profile.get("core_essence", archetype),
+            "soulprint_text": core_essence,
             "archetype": archetype,
             "soul_md": soul_files.get("soul_md"),
             "identity_md": soul_files.get("identity_md"),
@@ -2843,8 +2852,26 @@ async def generate_soulprint_from_chunks(user_id: str, client: httpx.AsyncClient
             "user_md": soul_files.get("user_md"),
             "memory_log": memory_log,
             "soulprint_generated_at": datetime.utcnow().isoformat(),
-        },
-    )
+        }
+
+        print(f"[RLM] Saving SoulPrint - archetype: {archetype}, core_essence length: {len(core_essence)}")
+
+        save_resp = await save_client.patch(
+            f"{SUPABASE_URL}/rest/v1/user_profiles",
+            params={"user_id": f"eq.{user_id}"},
+            headers=save_headers,
+            json=save_data,
+        )
+
+        if save_resp.status_code not in (200, 204):
+            print(f"[RLM] SoulPrint save FAILED: {save_resp.status_code} - {save_resp.text[:500]}")
+        else:
+            result = save_resp.json() if save_resp.text else []
+            if result:
+                saved_archetype = result[0].get("archetype", "UNKNOWN")
+                print(f"[RLM] SoulPrint save VERIFIED - archetype in DB: {saved_archetype}")
+            else:
+                print(f"[RLM] SoulPrint save returned empty - may not have updated")
 
     print(f"[RLM] SoulPrint generated and saved for user {user_id}")
 
