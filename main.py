@@ -144,6 +144,7 @@ async def embed_text_bedrock(text: str, bedrock_client=None) -> Optional[List[fl
     if not bedrock_client:
         bedrock_client = get_bedrock_client()
     if not bedrock_client:
+        print("[RLM] No bedrock client available")
         return None
 
     try:
@@ -152,7 +153,7 @@ async def embed_text_bedrock(text: str, bedrock_client=None) -> Optional[List[fl
             return None
 
         # Remove null bytes and other problematic characters
-        text = text.replace('\x00', '').strip()
+        text = text.replace('\x00', '').replace('\r', ' ').replace('\n', ' ').strip()
 
         # Must have actual content
         if len(text) < 3:
@@ -161,12 +162,13 @@ async def embed_text_bedrock(text: str, bedrock_client=None) -> Optional[List[fl
         # Truncate to max input size (Titan limit is ~8k tokens, ~32k chars safe)
         text = text[:8000]
 
-        # Titan Embed v2 request format - must match Vercel format exactly
+        # Titan Embed v2 request format
+        # Note: dimensions and normalize are optional, try without them first
         request_body = json.dumps({
-            "inputText": text,
-            "dimensions": 768,
-            "normalize": True
-        }).encode('utf-8')
+            "inputText": text
+        })
+
+        print(f"[RLM] Calling Bedrock model: {BEDROCK_EMBEDDING_MODEL_ID}, text length: {len(text)}")
 
         response = bedrock_client.invoke_model(
             modelId=BEDROCK_EMBEDDING_MODEL_ID,
@@ -176,10 +178,17 @@ async def embed_text_bedrock(text: str, bedrock_client=None) -> Optional[List[fl
         )
 
         result = json.loads(response['body'].read())
-        return result.get('embedding')
+        embedding = result.get('embedding')
+        if embedding:
+            print(f"[RLM] Got embedding with {len(embedding)} dimensions")
+        return embedding
     except Exception as e:
-        # Only log first 100 chars of error to avoid spam
-        print(f"[RLM] Bedrock embed error: {str(e)[:100]}")
+        error_str = str(e)
+        print(f"[RLM] Bedrock embed error: {error_str[:200]}")
+        # Log full error once
+        if "first_error_logged" not in dir(embed_text_bedrock):
+            embed_text_bedrock.first_error_logged = True
+            print(f"[RLM] Full error: {error_str}")
         return None
 
 
@@ -1338,6 +1347,34 @@ async def health():
         "bedrock_available": BEDROCK_AVAILABLE and bool(AWS_ACCESS_KEY_ID),
         "timestamp": datetime.utcnow().isoformat(),
     }
+
+
+@app.get("/test-embed")
+async def test_embed():
+    """Test Bedrock embedding with a simple string"""
+    test_text = "Hello, this is a test message for embedding."
+
+    try:
+        embedding = await embed_text_bedrock(test_text)
+        if embedding:
+            return {
+                "success": True,
+                "model": BEDROCK_EMBEDDING_MODEL_ID,
+                "dimensions": len(embedding),
+                "sample": embedding[:5],
+            }
+        else:
+            return {
+                "success": False,
+                "error": "No embedding returned",
+                "model": BEDROCK_EMBEDDING_MODEL_ID,
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "model": BEDROCK_EMBEDDING_MODEL_ID,
+        }
 
 
 @app.post("/query", response_model=QueryResponse)
