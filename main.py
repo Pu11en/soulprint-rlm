@@ -2424,31 +2424,35 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
                         print(f"[RLM] No embedding returned for chunk {chunk['id']}")
                         return False
 
-                    # PATCH with return=representation to verify update happened
-                    patch_headers = {
-                        **headers,
-                        "Prefer": "return=representation",
-                    }
-                    patch_resp = await client.patch(
-                        f"{SUPABASE_URL}/rest/v1/conversation_chunks",
-                        params={"id": f"eq.{chunk['id']}"},
-                        headers=patch_headers,
-                        json={"embedding": embedding},  # Send as array, not string
-                    )
+                    # Create dedicated client for this PATCH to avoid connection pooling issues
+                    async with httpx.AsyncClient(timeout=30.0) as patch_client:
+                        # PATCH with return=representation to verify update happened
+                        patch_headers = {
+                            "apikey": SUPABASE_SERVICE_KEY,
+                            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                            "Content-Type": "application/json",
+                            "Prefer": "return=representation",
+                        }
+                        patch_resp = await patch_client.patch(
+                            f"{SUPABASE_URL}/rest/v1/conversation_chunks",
+                            params={"id": f"eq.{chunk['id']}"},
+                            headers=patch_headers,
+                            json={"embedding": embedding},  # Send as array, not string
+                        )
 
-                    # Check status AND that a row was actually returned
-                    if patch_resp.status_code not in (200, 204):
-                        print(f"[RLM] PATCH failed for {chunk['id']}: {patch_resp.status_code} - {patch_resp.text[:200]}")
-                        return False
+                        # Check status AND that a row was actually returned
+                        if patch_resp.status_code not in (200, 204):
+                            print(f"[RLM] PATCH failed for {chunk['id']}: {patch_resp.status_code} - {patch_resp.text[:200]}")
+                            return False
 
-                    # Verify row was actually updated (return=representation gives us the row)
-                    result = patch_resp.json() if patch_resp.text else []
-                    if not result:
-                        print(f"[RLM] PATCH returned empty - row {chunk['id']} may not exist or wasn't updated")
-                        print(f"[RLM] Response status: {patch_resp.status_code}, body: {patch_resp.text[:500] if patch_resp.text else 'empty'}")
-                        return False
+                        # Verify row was actually updated (return=representation gives us the row)
+                        result = patch_resp.json() if patch_resp.text else []
+                        if not result:
+                            print(f"[RLM] PATCH returned empty - row {chunk['id']} may not exist or wasn't updated")
+                            print(f"[RLM] Response status: {patch_resp.status_code}, body: {patch_resp.text[:500] if patch_resp.text else 'empty'}")
+                            return False
 
-                    return True
+                        return True
                 except Exception as e:
                     print(f"[RLM] Embed error for {chunk['id']}: {e}")
                 return False
