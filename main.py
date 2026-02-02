@@ -2781,7 +2781,7 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
             # Mark import as complete so user can start chatting
             # Embeddings will continue in background to improve memory search
             soulprint_time = time.time() - start
-            await client.patch(
+            completion_patch_resp = await client.patch(
                 f"{SUPABASE_URL}/rest/v1/user_profiles",
                 params={"user_id": f"eq.{user_id}"},
                 headers=headers,
@@ -2791,6 +2791,11 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
                     "memory_status": "building",  # Memory still improving
                 },
             )
+
+            if completion_patch_resp.status_code not in (200, 204):
+                error_msg = f"Failed to mark import complete: {completion_patch_resp.status_code} - {completion_patch_resp.text[:500]}"
+                print(f"[RLM] ❌ {error_msg}")
+                raise Exception(error_msg)
 
             # Send email NOW - user can start chatting
             vercel_url = VERCEL_API_URL
