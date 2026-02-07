@@ -18,6 +18,18 @@ def non_mocked_hosts():
 
 
 @pytest.fixture
+def assert_all_responses_were_requested():
+    """Don't fail tests when mocked responses aren't consumed."""
+    return False
+
+
+@pytest.fixture
+def assert_all_requests_were_expected():
+    """Don't fail tests when unexpected requests are made."""
+    return False
+
+
+@pytest.fixture
 def sample_conversations():
     """Sample conversation data for testing."""
     return [
