@@ -2531,7 +2531,16 @@ async def run_full_pass_v2_background(
     job_id: Optional[str] = None,
 ):
     """Background task wrapper for v2 pipeline (processors from Phase 2)."""
+    from adapters.supabase_adapter import update_user_profile as update_profile_status
+
     try:
+        # Mark pipeline as processing
+        await update_profile_status(user_id, {
+            "full_pass_status": "processing",
+            "full_pass_started_at": datetime.utcnow().isoformat(),
+            "full_pass_error": None,
+        })
+
         from processors.full_pass import run_full_pass_pipeline
 
         print(f"[v2] Starting pipeline for user {user_id}")
@@ -2544,13 +2553,26 @@ async def run_full_pass_v2_background(
 
         print(f"[v2] Pipeline complete for user {user_id}")
 
+        # Mark pipeline as complete
+        await update_profile_status(user_id, {
+            "full_pass_status": "complete",
+            "full_pass_completed_at": datetime.utcnow().isoformat(),
+        })
+
         if job_id:
             await complete_job(job_id, success=True)
 
     except Exception as e:
-        print(f"[v2] Pipeline FAILED for user {user_id}: {e}")
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        print(f"[v2] user_id={user_id} step=pipeline status=failed error={error_msg}")
         import traceback
         traceback.print_exc()
+
+        # Mark pipeline as failed with error context
+        await update_profile_status(user_id, {
+            "full_pass_status": "failed",
+            "full_pass_error": f"Pipeline failed: {error_msg[:500]}",
+        })
 
         if job_id:
             await complete_job(job_id, success=False, error_message=str(e)[:500])
