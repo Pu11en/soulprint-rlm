@@ -2525,6 +2525,85 @@ async def process_full(request: ProcessFullRequest, background_tasks: Background
     }
 
 
+async def run_full_pass_v2_background(
+    user_id: str,
+    storage_path: str,
+    job_id: Optional[str] = None,
+):
+    """Background task wrapper for v2 pipeline (processors from Phase 2)."""
+    try:
+        from processors.full_pass import run_full_pass_pipeline
+
+        print(f"[v2] Starting pipeline for user {user_id}")
+        print(f"[v2] Storage path: {storage_path}")
+
+        memory_md = await run_full_pass_pipeline(
+            user_id=user_id,
+            storage_path=storage_path,
+        )
+
+        print(f"[v2] Pipeline complete for user {user_id}")
+
+        if job_id:
+            await complete_job(job_id, success=True)
+
+    except Exception as e:
+        print(f"[v2] Pipeline FAILED for user {user_id}: {e}")
+        import traceback
+        traceback.print_exc()
+
+        if job_id:
+            await complete_job(job_id, success=False, error_message=str(e)[:500])
+
+
+@app.post("/process-full-v2")
+async def process_full_v2(request: ProcessFullRequest, background_tasks: BackgroundTasks):
+    """
+    V2 full processing pipeline using modular processors from v1.2.
+
+    Pipeline: chunk conversations -> extract facts (parallel) -> consolidate ->
+    generate MEMORY section -> regenerate v2 sections (SOUL, IDENTITY, USER, AGENTS, TOOLS)
+
+    Uses processors/ modules (Phase 2) instead of inline main.py logic.
+    Runs alongside v1 /process-full for gradual migration.
+    """
+    print(f"[v2] Received process-full-v2 request for user {request.user_id}")
+
+    if not request.storage_path:
+        raise HTTPException(
+            status_code=400,
+            detail="storage_path required for v2 pipeline (direct conversations not supported)"
+        )
+
+    # Create job record for recovery (reuses existing job system)
+    job_id = await create_job(
+        request.user_id,
+        request.storage_path,
+        request.conversation_count or 0,
+        request.message_count or 0,
+    )
+
+    if job_id:
+        print(f"[v2] Created job {job_id}")
+
+    # Dispatch to background
+    background_tasks.add_task(
+        run_full_pass_v2_background,
+        request.user_id,
+        request.storage_path,
+        job_id,
+    )
+
+    return {
+        "status": "processing",
+        "version": "v2",
+        "message": "v2 pipeline started: chunk → facts → MEMORY → v2 sections",
+        "user_id": request.user_id,
+        "conversation_count": request.conversation_count,
+        "job_id": job_id,
+    }
+
+
 class EmbedChunksRequest(BaseModel):
     user_id: str
 
