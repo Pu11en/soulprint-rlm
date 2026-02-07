@@ -14,6 +14,7 @@ import httpx
 import time
 import asyncio
 import anthropic
+from contextlib import asynccontextmanager
 from datetime import datetime, date
 from typing import Optional, List, Tuple
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -39,7 +40,102 @@ except ImportError:
 
 load_dotenv()
 
-app = FastAPI(title="SoulPrint RLM Service")
+
+async def startup_check_incomplete_embeddings_logic():
+    """
+    Check for any users with incomplete embeddings and queue them.
+    This ensures embeddings always get completed even if the server restarts.
+
+    Extracted from @app.on_event("startup") for lifespan migration.
+    """
+    print("[RLM] Checking for users with incomplete embeddings...")
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            headers = {
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            }
+
+            # Find users with import_status=complete but embedding_status != complete
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/user_profiles",
+                params={
+                    "import_status": "eq.complete",
+                    "embedding_status": "neq.complete",
+                    "select": "user_id",
+                    "limit": "10",  # Process up to 10 users
+                },
+                headers=headers,
+            )
+
+            if resp.status_code != 200:
+                print(f"[RLM] Failed to check incomplete embeddings: {resp.text[:200]}")
+                return
+
+            users = resp.json()
+            if not users:
+                print("[RLM] No users with incomplete embeddings")
+                return
+
+            print(f"[RLM] Found {len(users)} users with incomplete embeddings")
+
+            for user in users:
+                user_id = user.get("user_id")
+                if user_id:
+                    print(f"[RLM] Queuing embedding completion for {user_id}")
+                    asyncio.create_task(complete_embeddings_background(user_id))
+
+    except Exception as e:
+        print(f"[RLM] Error checking incomplete embeddings: {e}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup/shutdown lifecycle with processor validation."""
+    # Validate all processor modules import correctly (fail fast)
+    print("[Startup] Validating processor modules...")
+    try:
+        from processors.conversation_chunker import chunk_conversations
+        from processors.fact_extractor import extract_facts_parallel, consolidate_facts, hierarchical_reduce
+        from processors.memory_generator import generate_memory_section
+        from processors.v2_regenerator import regenerate_sections_v2, sections_to_soulprint_text
+        from processors.full_pass import run_full_pass_pipeline
+        print("[Startup] All processor modules imported successfully")
+    except ImportError as e:
+        print(f"[FATAL] Processor import failed: {e}")
+        raise  # Crash the app - Render will not route traffic
+
+    # Migrate existing startup logic from @app.on_event("startup") handlers:
+
+    # 1. From startup_event() at line ~171: Check for stuck jobs
+    await asyncio.sleep(2)
+    await resume_stuck_jobs()
+
+    # 2. From startup() at line ~1710: Check RLM/Bedrock availability
+    if not RLM_AVAILABLE:
+        print(f"[RLM] Warning: RLM library not available: {RLM_IMPORT_ERROR}")
+    else:
+        print("[RLM] RLM library loaded successfully")
+
+    if BEDROCK_AVAILABLE and AWS_ACCESS_KEY_ID:
+        print("[RLM] AWS Bedrock configured - using Titan embeddings")
+    elif COHERE_API_KEY:
+        print("[RLM] Cohere API key configured - using Cohere embeddings")
+    else:
+        print("[RLM] Warning: No embedding service configured")
+
+    # 3. From startup_check_incomplete_embeddings() at line ~3555: Resume incomplete embeddings
+    await asyncio.sleep(5)
+    await startup_check_incomplete_embeddings_logic()
+
+    yield  # Application runs here
+
+    # Shutdown
+    print("[Shutdown] Cleanup complete")
+
+
+app = FastAPI(title="SoulPrint RLM Service", lifespan=lifespan)
 
 # CORS
 app.add_middleware(
@@ -167,13 +263,6 @@ async def resume_stuck_jobs():
             process_full_background(user_id, storage_path, job_id=job_id)
         )
 
-
-@app.on_event("startup")
-async def startup_event():
-    """Run on server startup - check for stuck jobs."""
-    # Small delay to let server fully initialize
-    await asyncio.sleep(2)
-    await resume_stuck_jobs()
 
 # Config
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -1707,32 +1796,28 @@ def build_context(chunks: List[dict], soulprint_text: Optional[str], history: Li
     return "\n\n".join(context_parts)
 
 
-@app.on_event("startup")
-async def startup():
-    """Check availability on startup"""
-    if not RLM_AVAILABLE:
-        print(f"[RLM] Warning: RLM library not available: {RLM_IMPORT_ERROR}")
-    else:
-        print("[RLM] RLM library loaded successfully")
-
-    if BEDROCK_AVAILABLE and AWS_ACCESS_KEY_ID:
-        print("[RLM] AWS Bedrock configured - using Titan embeddings")
-    elif COHERE_API_KEY:
-        print("[RLM] Cohere API key configured - using Cohere embeddings")
-    else:
-        print("[RLM] Warning: No embedding service configured")
-
-
 @app.get("/health")
 async def health():
-    """Health check"""
-    return {
+    """Health check with processor validation for Render auto-restart."""
+    health_status = {
         "status": "ok",
         "service": "soulprint-rlm",
         "rlm_available": RLM_AVAILABLE,
         "bedrock_available": BEDROCK_AVAILABLE and bool(AWS_ACCESS_KEY_ID),
         "timestamp": datetime.utcnow().isoformat(),
     }
+
+    # Validate processor imports (lightweight check)
+    try:
+        from processors.full_pass import run_full_pass_pipeline
+        health_status["processors_available"] = True
+    except ImportError as e:
+        health_status["processors_available"] = False
+        health_status["processor_error"] = str(e)
+        # Return 503 to trigger Render auto-restart
+        raise HTTPException(status_code=503, detail=f"Processor modules unavailable: {e}")
+
+    return health_status
 
 
 @app.get("/health-deep")
@@ -3550,54 +3635,3 @@ async def complete_embeddings_background(user_id: str):
 
     # Alert on completion
     await alert_drew(f"✅ Embeddings Complete\n\nUser: {user_id}\nChunks: {total_embedded}\nTime: {elapsed:.1f}s")
-
-
-@app.on_event("startup")
-async def startup_check_incomplete_embeddings():
-    """
-    On startup, check for any users with incomplete embeddings and queue them.
-    This ensures embeddings always get completed even if the server restarts.
-    """
-    # Wait for server to fully initialize
-    await asyncio.sleep(5)
-
-    print("[RLM] Checking for users with incomplete embeddings...")
-
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            headers = {
-                "apikey": SUPABASE_SERVICE_KEY,
-                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-            }
-
-            # Find users with import_status=complete but embedding_status != complete
-            resp = await client.get(
-                f"{SUPABASE_URL}/rest/v1/user_profiles",
-                params={
-                    "import_status": "eq.complete",
-                    "embedding_status": "neq.complete",
-                    "select": "user_id",
-                    "limit": "10",  # Process up to 10 users
-                },
-                headers=headers,
-            )
-
-            if resp.status_code != 200:
-                print(f"[RLM] Failed to check incomplete embeddings: {resp.text[:200]}")
-                return
-
-            users = resp.json()
-            if not users:
-                print("[RLM] No users with incomplete embeddings")
-                return
-
-            print(f"[RLM] Found {len(users)} users with incomplete embeddings")
-
-            for user in users:
-                user_id = user.get("user_id")
-                if user_id:
-                    print(f"[RLM] Queuing embedding completion for {user_id}")
-                    asyncio.create_task(complete_embeddings_background(user_id))
-
-    except Exception as e:
-        print(f"[RLM] Error checking incomplete embeddings: {e}")
