@@ -15,9 +15,14 @@ def client(httpx_mock, monkeypatch):
 
     The lifespan runs on TestClient creation and makes Supabase calls
     (resume_stuck_jobs, check_incomplete_embeddings). Mock these.
+
+    Background tasks may make additional requests, so we don't assert
+    all requests were expected (some happen async after test completes).
     """
     # Allow responses to be used multiple times
     httpx_mock.can_send_already_matched_responses = True
+    # Don't fail on unexpected requests from background tasks
+    httpx_mock._options.assert_all_requests_were_expected = False
 
     # Mock stuck jobs check (returns empty list)
     httpx_mock.add_response(
