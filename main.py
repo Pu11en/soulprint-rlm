@@ -17,7 +17,7 @@ import anthropic
 from contextlib import asynccontextmanager
 from datetime import datetime, date
 from typing import Optional, List, Tuple
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -2477,9 +2477,13 @@ class ProcessFullRequest(BaseModel):
 
 
 @app.post("/process-full")
-async def process_full(request: ProcessFullRequest, background_tasks: BackgroundTasks):
+async def process_full(request: ProcessFullRequest, background_tasks: BackgroundTasks, response: Response):
     """
-    Full processing pipeline: Create chunks → Embed → Generate SoulPrint.
+    DEPRECATED: Full processing pipeline: Create chunks → Embed → Generate SoulPrint.
+
+    This endpoint is deprecated. Use /process-full-v2 instead.
+    Sunset date: March 1, 2026.
+
     Called by Vercel after parsing ZIP. Runs in background - no timeout.
 
     Supports two modes:
@@ -2488,6 +2492,14 @@ async def process_full(request: ProcessFullRequest, background_tasks: Background
 
     Jobs are tracked in processing_jobs table for recovery after server restarts.
     """
+    # Deprecation headers (RFC 8594)
+    response.headers["Deprecation"] = "true"
+    response.headers["Sunset"] = "Sat, 01 Mar 2026 00:00:00 GMT"
+    response.headers["Link"] = '</process-full-v2>; rel="alternate"'
+
+    # Log deprecation usage
+    print(f"[DEPRECATED] /process-full called by user {request.user_id}")
+
     print(f"[RLM] Received process-full request for user {request.user_id}")
 
     job_id = None
@@ -2522,6 +2534,7 @@ async def process_full(request: ProcessFullRequest, background_tasks: Background
         "user_id": request.user_id,
         "conversation_count": request.conversation_count,
         "job_id": job_id,
+        "deprecation_notice": "This endpoint is deprecated. Use /process-full-v2 instead. Sunset: March 1, 2026.",
     }
 
 
