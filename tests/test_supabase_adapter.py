@@ -355,6 +355,64 @@ async def test_save_chunks_batch_no_created_at(httpx_mock):
 
 
 @pytest.mark.anyio
+async def test_save_chunks_batch_timezone_aware_datetime(httpx_mock):
+    """Test is_recent calculation with timezone-aware datetime."""
+    # Arrange
+    user_id = "test-user-id"
+    # Use timezone-aware datetime (with Z suffix)
+    recent_date = (datetime.utcnow() - timedelta(days=30)).isoformat() + "Z"
+    chunks = [
+        {
+            "conversation_id": "conv-tz",
+            "title": "Timezone Test",
+            "content": "Content with TZ",
+            "created_at": recent_date,
+        }
+    ]
+
+    httpx_mock.add_response(
+        url="https://swvljsixpvvcirjmflze.supabase.co/rest/v1/conversation_chunks",
+        status_code=201,
+    )
+
+    # Act
+    await save_chunks_batch(user_id, chunks)
+
+    # Assert
+    request = httpx_mock.get_request()
+    body = request.content.decode()
+    assert '"is_recent":true' in body
+
+
+@pytest.mark.anyio
+async def test_save_chunks_batch_invalid_datetime_format(httpx_mock):
+    """Test is_recent=False when created_at has invalid format."""
+    # Arrange
+    user_id = "test-user-id"
+    chunks = [
+        {
+            "conversation_id": "conv-invalid",
+            "title": "Invalid Date",
+            "content": "Content with invalid date",
+            "created_at": "not-a-valid-date",
+        }
+    ]
+
+    httpx_mock.add_response(
+        url="https://swvljsixpvvcirjmflze.supabase.co/rest/v1/conversation_chunks",
+        status_code=201,
+    )
+
+    # Act
+    await save_chunks_batch(user_id, chunks)
+
+    # Assert
+    request = httpx_mock.get_request()
+    body = request.content.decode()
+    assert '"is_recent":false' in body
+
+
+@pytest.mark.anyio
 async def test_save_chunks_batch_failure_500(httpx_mock):
     """Test chunk save failure handling - 500 server error."""
     # Arrange
