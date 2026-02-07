@@ -12,6 +12,12 @@ def mock_env_vars(monkeypatch):
 
 
 @pytest.fixture
+def non_mocked_hosts():
+    """Allow all hosts to be mocked for endpoint tests."""
+    return []
+
+
+@pytest.fixture
 def sample_conversations():
     """Sample conversation data for testing."""
     return [
