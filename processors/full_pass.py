@@ -12,6 +12,21 @@ from typing import List, Dict
 from adapters import download_conversations, update_user_profile, save_chunks_batch
 
 
+def get_concurrency_limit() -> int:
+    """Get fact extraction concurrency from environment (default 3 for Render Starter)."""
+    default = 3
+    try:
+        raw = os.getenv("FACT_EXTRACTION_CONCURRENCY", str(default))
+        limit = int(raw)
+        if limit < 1 or limit > 50:
+            print(f"[FullPass] WARN: Invalid concurrency {limit}, using default {default}")
+            return default
+        return limit
+    except ValueError:
+        print(f"[FullPass] WARN: Invalid FACT_EXTRACTION_CONCURRENCY value, using default {default}")
+        return default
+
+
 async def delete_user_chunks(user_id: str):
     """
     Delete all existing conversation chunks for a user (fresh start).
@@ -69,23 +84,22 @@ async def run_full_pass_pipeline(
     Returns:
         Generated memory_md string (for v2 regeneration in Plan 02-03)
     """
-    print(f"[FullPass] Starting pipeline for user {user_id}")
-    print(f"[FullPass] Storage path: {storage_path}")
-    print(f"[FullPass] Expected conversations: {conversation_count}")
-
     # Initialize Anthropic client
     client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
     # Step 1: Download conversations
+    print(f"[FullPass] user_id={user_id} step=download_conversations status=starting")
     conversations = await download_conversations(storage_path)
-    print(f"[FullPass] Downloaded {len(conversations)} conversations")
+    print(f"[FullPass] user_id={user_id} step=download_conversations conversations={len(conversations)}")
 
     # Step 2: Chunk conversations
+    print(f"[FullPass] user_id={user_id} step=chunk_conversations status=starting")
     from processors.conversation_chunker import chunk_conversations
     chunks = chunk_conversations(conversations, target_tokens=2000, overlap_tokens=200)
-    print(f"[FullPass] Created {len(chunks)} chunks from {len(conversations)} conversations")
+    print(f"[FullPass] user_id={user_id} step=chunk_conversations chunks={len(chunks)}")
 
     # Step 3: Save chunks to database (in batches to avoid request size limits)
+    print(f"[FullPass] user_id={user_id} step=save_chunks status=starting")
     batch_size = 100
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i:i+batch_size]
@@ -96,38 +110,47 @@ async def run_full_pass_pipeline(
 
         await save_chunks_batch(user_id, batch)
 
-    print(f"[FullPass] Saved {len(chunks)} chunks to database")
+    print(f"[FullPass] user_id={user_id} step=save_chunks chunks={len(chunks)}")
 
     # Step 4: Extract facts in parallel
+    print(f"[FullPass] user_id={user_id} step=extract_facts status=starting")
     from processors.fact_extractor import (
         extract_facts_parallel,
         consolidate_facts,
         hierarchical_reduce
     )
 
-    all_facts = await extract_facts_parallel(chunks, client, concurrency=10)
-    print(f"[FullPass] Extracted facts from {len(chunks)} chunks")
+    concurrency = get_concurrency_limit()
+    print(f"[FullPass] user_id={user_id} step=extract_facts concurrency={concurrency} chunks={len(chunks)}")
+    all_facts = await extract_facts_parallel(chunks, client, concurrency=concurrency)
+    print(f"[FullPass] user_id={user_id} step=extract_facts status=complete")
 
     # Step 5: Consolidate facts
+    print(f"[FullPass] user_id={user_id} step=consolidate_facts status=starting")
     consolidated = consolidate_facts(all_facts)
-    print(f"[FullPass] Consolidated {consolidated['total_count']} unique facts")
+    print(f"[FullPass] user_id={user_id} step=consolidate_facts total_count={consolidated['total_count']}")
 
     # Step 6: Reduce if too large (over 200K tokens)
+    print(f"[FullPass] user_id={user_id} step=hierarchical_reduce status=starting")
     reduced = await hierarchical_reduce(consolidated, client, max_tokens=200000)
+    token_estimate = len(str(reduced)) // 4  # rough estimate
+    print(f"[FullPass] user_id={user_id} step=hierarchical_reduce token_estimate={token_estimate}")
 
     # Step 7: Generate MEMORY section
+    print(f"[FullPass] user_id={user_id} step=generate_memory status=starting")
     from processors.memory_generator import generate_memory_section
     memory_md = await generate_memory_section(reduced, client)
-    print(f"[FullPass] Generated MEMORY section ({len(memory_md)} chars)")
+    print(f"[FullPass] user_id={user_id} step=generate_memory memory_length={len(memory_md)}")
 
     # Step 8: Save MEMORY to database (early save so user benefits even if v2 regen fails)
+    print(f"[FullPass] user_id={user_id} step=save_memory status=starting")
     await update_user_profile(user_id, {"memory_md": memory_md})
-    print(f"[FullPass] Saved MEMORY section to database")
+    print(f"[FullPass] user_id={user_id} step=save_memory status=complete")
 
     # Step 9: V2 Section Regeneration
     from processors.v2_regenerator import regenerate_sections_v2, sections_to_soulprint_text
 
-    print(f"[FullPass] Starting v2 section regeneration for user {user_id}")
+    print(f"[FullPass] user_id={user_id} step=v2_regeneration status=starting")
     v2_sections = await regenerate_sections_v2(conversations, memory_md, client)
 
     if v2_sections:
@@ -143,11 +166,11 @@ async def run_full_pass_pipeline(
             "tools_md": json.dumps(v2_sections["tools"]),
             "soulprint_text": soulprint_text,
         })
-        print(f"[FullPass] V2 sections saved for user {user_id}")
+        print(f"[FullPass] user_id={user_id} step=v2_regeneration status=success")
     else:
-        print(f"[FullPass] V2 regeneration failed -- keeping v1 sections for user {user_id}")
+        print(f"[FullPass] user_id={user_id} step=v2_regeneration status=failed_non_fatal")
         # V1 sections stay, MEMORY already saved above
 
-    print(f"[FullPass] Pipeline complete for user {user_id}")
+    print(f"[FullPass] user_id={user_id} step=complete")
 
     return memory_md
