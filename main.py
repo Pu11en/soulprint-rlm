@@ -3457,7 +3457,7 @@ async def embed_chunks_background(user_id: str):
                     },
                     json={
                         "embedding_status": "failed",
-                        "import_error": error_msg[:500],
+                        # Don't set import_error - embedding is background enhancement, not import failure
                     },
                 )
         except:
