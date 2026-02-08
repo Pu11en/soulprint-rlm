@@ -2,7 +2,15 @@
 
 ## When to Rollback
 
-Rollback if ANY of these are true after deploying Phase 3 changes:
+Rollback if ANY of these are true after deploying changes:
+
+**Phase 7 (Prompt Foundation) - Deployed 2026-02-08:**
+- AI responses are generic (ignoring personality traits, using banned phrases like "Great question!")
+- /query endpoint returns 500 errors (prompt_helpers import failure)
+- Render build fails with "ModuleNotFoundError: No module named 'prompt_helpers'"
+- AI does not reference its name (uses "SoulPrint" instead of generated name)
+
+**Phase 3 (Processor Infrastructure):**
 - /health endpoint returns 503 (processor import failure)
 - Existing endpoints (/process-full, /chat, /query) return 500 errors
 - Render dashboard shows service as unhealthy
@@ -65,6 +73,14 @@ After rollback stabilizes production:
 
 ## What Gets Lost During Rollback
 
+**Phase 7 Rollback (Prompt Foundation):**
+- Personalized AI prompts revert to hardcoded "You are SoulPrint" generic prompts
+- Personality traits, communication style, and values are ignored in responses
+- Anti-generic phrase blocking is removed (AI may use "Great question!", "I'd be happy to help!")
+- Memory context referencing becomes less natural ("According to retrieved context..." instead of "Like we talked about...")
+- AI stops using its generated name
+
+**Phase 3 Rollback (Processor Infrastructure):**
 - /process-full-v2 endpoint becomes unavailable
 - Processor import validation in health check removed
 - Lifespan startup validation removed (reverts to @app.on_event)
