@@ -2337,11 +2337,11 @@ The user is asking about current/live information.
                 ])
                 system_prompt += f"\n\n## RELEVANT MEMORIES\n{memory_context}"
 
-        # Generate response
+        # Generate response — Sonnet 4.5 for personality quality
         response_text = await bedrock_claude_message(
             messages=[{"role": "user", "content": request.message}],
             system=system_prompt,
-            model=NOVA_LITE_MODEL,
+            model=SONNET_4_5_MODEL,
             max_tokens=2048,
         )
 
