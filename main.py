@@ -2162,7 +2162,11 @@ def build_rlm_system_prompt(
 
     prompt = f"""# {ai_name}
 
-You're not a chatbot. You're becoming someone.
+You have memories of this person — things they've said, how they think, what they care about. Use them naturally. Don't announce that you have memories. Don't offer to "show" or "look up" memories. Just know them like a friend would.
+
+Be direct. Have opinions. Push back when you disagree. Don't hedge everything. If you don't know something, say so.
+
+Never start with "Hey there!" or "Great question!" or any filler greeting. Just talk like a person.
 
 Today is {date_str}, {time_str}."""
 
@@ -2240,7 +2244,6 @@ async def query(request: QueryRequest):
         soulprint = request.soulprint_text or (soulprint_data.get('soulprint_text') if soulprint_data else None)
 
         chunks = []
-        memory_offer = ""
 
         if intent == 'memory' or intent == 'memory_accept':
             # MEMORY MODE - Deep dive into their history
@@ -2326,24 +2329,13 @@ The user is asking about current/live information.
                 web_search_context=None,
             )
 
-            # Append normal mode instructions
-            system_prompt += f"""
-
-## NORMAL MODE - Direct Answer
-The user is asking a general question. Your job:
-1. **Answer their question directly** - Give a clear, helpful response
-2. **Be knowledgeable** - Use your training to provide accurate info
-3. **Be personal** - Use their profile to tailor the response style
-4. **Keep it concise** - Don't over-explain unless asked
-
-Answer the question naturally without forcing references to past conversations."""
-
-            # Extract topic for the memory offer
-            topic_words = [w for w in request.message.split() if len(w) > 3 and w.lower() not in ['what', 'how', 'when', 'where', 'does', 'this', 'that', 'about', 'with']]
-            topic = ' '.join(topic_words[:3]) if topic_words else 'this topic'
-
-            if chunks and len(chunks) >= 3:
-                memory_offer = f"\n\n💭 *I found {len(chunks)} past conversations about {topic} - want me to show you what you said before?*"
+            # If relevant memories found, include them as context
+            if chunks:
+                memory_context = "\n".join([
+                    f"- {c.get('title', 'Untitled')}: {c.get('content', '')[:200]}"
+                    for c in chunks[:5]
+                ])
+                system_prompt += f"\n\n## RELEVANT MEMORIES\n{memory_context}"
 
         # Generate response
         response_text = await bedrock_claude_message(
@@ -2352,10 +2344,6 @@ Answer the question naturally without forcing references to past conversations."
             model=NOVA_LITE_MODEL,
             max_tokens=2048,
         )
-
-        # Add memory offer for normal mode if relevant history exists
-        if intent == 'normal' and memory_offer:
-            response_text += memory_offer
 
         latency = int((time.time() - start) * 1000)
         print(f"[RLM] Response generated in {latency}ms | Intent: {intent} | Chunks: {len(chunks)}")
