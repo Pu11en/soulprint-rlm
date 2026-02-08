@@ -3300,7 +3300,7 @@ async def process_full_background(user_id: str, storage_path: Optional[str], con
                         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
                         "Content-Type": "application/json",
                     },
-                    json={"import_status": "failed", "import_error": error_msg[:500]},
+                    json={"full_pass_status": "failed", "full_pass_error": error_msg[:500]},
                 )
         except:
             pass
