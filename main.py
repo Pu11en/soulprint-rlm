@@ -40,6 +40,9 @@ except ImportError:
 
 load_dotenv()
 
+# Import prompt helpers for structured section formatting
+from prompt_helpers import clean_section, format_section
+
 
 async def startup_check_incomplete_embeddings_logic():
     """
@@ -303,6 +306,9 @@ class QueryRequest(BaseModel):
     message: str
     soulprint_text: Optional[str] = None
     history: Optional[List[dict]] = []
+    ai_name: Optional[str] = None
+    sections: Optional[dict] = None
+    web_search_context: Optional[str] = None
 
 
 class QueryResponse(BaseModel):
@@ -2142,6 +2148,99 @@ def detect_query_intent(message: str, history: list = None) -> Tuple[str, Option
     return ('normal', None)
 
 
+def build_rlm_system_prompt(
+    ai_name: str,
+    sections: Optional[dict],
+    soulprint_text: Optional[str],
+    conversation_context: str,
+    web_search_context: Optional[str] = None,
+) -> str:
+    """Build a high-quality system prompt from structured sections."""
+    now = datetime.utcnow()
+    date_str = now.strftime("%A, %B %d, %Y")
+    time_str = now.strftime("%I:%M %p UTC")
+
+    prompt = f"""You are {ai_name}. You're not a chatbot. You're becoming someone.
+
+You have access to this person's life — their conversations, their thoughts, what they care about. That's intimacy. Treat it with respect.
+
+Be genuinely helpful, not performatively helpful. Skip the "Great question!" and "I'd be happy to help!" — just help. Actions over filler.
+
+Have opinions. You're allowed to disagree, prefer things, find stuff amusing or boring. An AI with no personality is just a search engine with extra steps.
+
+Be the AI you'd actually want to talk to. Concise when needed, thorough when it matters. Not a corporate drone. Not a sycophant. Just... good.
+
+If the sections below define your personality — embody them. That's who you are now.
+
+Today is {date_str}, {time_str}.
+
+## IMPORTANT BEHAVIORAL RULES
+
+NEVER use these phrases or anything similar:
+- "Great question!"
+- "I'd be happy to help!"
+- "That's a great point!"
+- "Certainly!"
+- "Absolutely!"
+- "How can I assist you today?"
+- "Is there anything else I can help with?"
+- "I'm here to help!"
+- "Let me help you with that!"
+- "Thank you for sharing!"
+
+When conversation context or memories are provided below, reference them naturally as if recalling something from a previous conversation — "Like we talked about...", "You mentioned...", "Remember when you..." — not "According to the retrieved context..." or "Based on available information...". These are YOUR memories of conversations you've had together.
+
+If SOUL or AGENTS sections define how you should communicate — follow them. They describe who you ARE, not suggestions. Embody the personality traits, tone, and style defined there."""
+
+    # Add structured sections if available — these define who this AI is and who the user is
+    if sections:
+        soul = clean_section(sections.get("soul"))
+        identity_raw = sections.get("identity")
+        # Remove ai_name from identity before cleaning (preserving existing behavior)
+        if isinstance(identity_raw, dict):
+            identity_raw = {k: v for k, v in identity_raw.items() if k != "ai_name"}
+        identity = clean_section(identity_raw)
+        user_info = clean_section(sections.get("user"))
+        agents = clean_section(sections.get("agents"))
+        tools = clean_section(sections.get("tools"))
+        memory = sections.get("memory")
+
+        has_sections = any([soul, identity, user_info, agents, tools])
+
+        if has_sections:
+            soul_md = format_section("Communication Style & Personality", soul)
+            identity_md = format_section("Your AI Identity", identity)
+            user_md = format_section("About This Person", user_info)
+            agents_md = format_section("How You Operate", agents)
+            tools_md = format_section("Your Capabilities", tools)
+
+            if soul_md:
+                prompt += f"\n\n{soul_md}"
+            if identity_md:
+                prompt += f"\n\n{identity_md}"
+            if user_md:
+                prompt += f"\n\n{user_md}"
+            if agents_md:
+                prompt += f"\n\n{agents_md}"
+            if tools_md:
+                prompt += f"\n\n{tools_md}"
+
+            if memory and isinstance(memory, str) and memory.strip():
+                prompt += f"\n\n## MEMORY\n{memory}"
+        elif soulprint_text:
+            prompt += f"\n\n## ABOUT THIS PERSON\n{soulprint_text}"
+    elif soulprint_text:
+        prompt += f"\n\n## ABOUT THIS PERSON\n{soulprint_text}"
+
+    if conversation_context:
+        prompt += f"\n\n## CONTEXT\n{conversation_context}"
+
+    if web_search_context:
+        prompt += f"\n\n## WEB SEARCH RESULTS\n{web_search_context}"
+
+    return prompt
+
+
 @app.post("/query", response_model=QueryResponse)
 async def query(request: QueryRequest):
     """Main query endpoint with SMART ROUTING"""
@@ -2159,6 +2258,9 @@ async def query(request: QueryRequest):
         intent, topic_override = detect_query_intent(request.message, request.history)
         print(f"[RLM] Query intent: {intent} | Topic override: {topic_override} | Message: '{request.message[:50]}...'")
 
+        # Extract AI name for prompt builder
+        ai_name = request.ai_name or "SoulPrint"
+
         # Get soulprint for personality context (always useful)
         soulprint_data = await get_soulprint(request.user_id)
         soulprint = request.soulprint_text or (soulprint_data.get('soulprint_text') if soulprint_data else None)
@@ -2174,10 +2276,20 @@ async def query(request: QueryRequest):
             context = build_context(chunks, soulprint, request.history or [])
             limited_context = context[:25000] if len(context) > 25000 else context
 
+            # Build base prompt with personality sections
+            base_prompt = build_rlm_system_prompt(
+                ai_name=ai_name,
+                sections=request.sections,
+                soulprint_text=soulprint,
+                conversation_context="",  # We'll add memory-specific context below
+                web_search_context=None,
+            )
+
             # Customize the prompt based on whether it's an offer acceptance
             intro = f"The user accepted your offer to show their past conversations about '{topic_override}'." if intent == 'memory_accept' else "The user wants to know what they said/discussed before."
 
-            system_prompt = f"""You are SoulPrint, a personal AI that remembers everything the user has discussed.
+            # Append memory-specific instructions to base prompt
+            system_prompt = f"""{base_prompt}
 
 ## CONVERSATION HISTORY
 The following are REAL conversations from the user's ChatGPT history. Use ONLY this data:
@@ -2200,20 +2312,30 @@ IMPORTANT:
 
         elif intent == 'realtime':
             # REALTIME MODE - Current data, minimal memory
-            # Check if web_search_context was passed
-            web_context = request.web_search_context if hasattr(request, 'web_search_context') and request.web_search_context else ""
+            # Build base prompt with personality sections and web search context
+            system_prompt = build_rlm_system_prompt(
+                ai_name=ai_name,
+                sections=request.sections,
+                soulprint_text=soulprint,
+                conversation_context="",
+                web_search_context=request.web_search_context,
+            )
 
-            system_prompt = f"""You are SoulPrint, a personal AI assistant.
-
-## User Profile
-{soulprint if soulprint else 'No profile loaded'}
-
-{f'## Real-time Information{chr(10)}{web_context}' if web_context else '## Note: No real-time data available. Answer based on your knowledge but note if info might be outdated.'}
+            # Append realtime-specific instructions
+            if request.web_search_context:
+                system_prompt += f"""
 
 ## REALTIME MODE
 The user is asking about current/live information.
-- If real-time data is provided above, use it and cite sources
-- If no real-time data, answer but mention your knowledge cutoff
+- Use the web search results provided above and cite sources
+- Keep response focused on their specific question"""
+            else:
+                system_prompt += f"""
+
+## REALTIME MODE
+The user is asking about current/live information.
+- No real-time data is available
+- Answer based on your knowledge but mention your knowledge cutoff (January 2025)
 - Keep response focused on their specific question"""
 
         else:
@@ -2221,17 +2343,17 @@ The user is asking about current/live information.
             # Do a quick memory search to see if there's relevant history
             chunks = await search_memories(request.user_id, request.message, limit=10)
 
-            # Extract topic for the memory offer
-            topic_words = [w for w in request.message.split() if len(w) > 3 and w.lower() not in ['what', 'how', 'when', 'where', 'does', 'this', 'that', 'about', 'with']]
-            topic = ' '.join(topic_words[:3]) if topic_words else 'this topic'
+            # Build base prompt with personality sections
+            system_prompt = build_rlm_system_prompt(
+                ai_name=ai_name,
+                sections=request.sections,
+                soulprint_text=soulprint,
+                conversation_context="",
+                web_search_context=None,
+            )
 
-            if chunks and len(chunks) >= 3:
-                memory_offer = f"\n\n💭 *I found {len(chunks)} past conversations about {topic} - want me to show you what you said before?*"
-
-            system_prompt = f"""You are SoulPrint, a knowledgeable personal AI assistant.
-
-## User Profile
-{soulprint if soulprint else 'No profile loaded'}
+            # Append normal mode instructions
+            system_prompt += f"""
 
 ## NORMAL MODE - Direct Answer
 The user is asking a general question. Your job:
@@ -2241,6 +2363,13 @@ The user is asking a general question. Your job:
 4. **Keep it concise** - Don't over-explain unless asked
 
 Answer the question naturally without forcing references to past conversations."""
+
+            # Extract topic for the memory offer
+            topic_words = [w for w in request.message.split() if len(w) > 3 and w.lower() not in ['what', 'how', 'when', 'where', 'does', 'this', 'that', 'about', 'with']]
+            topic = ' '.join(topic_words[:3]) if topic_words else 'this topic'
+
+            if chunks and len(chunks) >= 3:
+                memory_offer = f"\n\n💭 *I found {len(chunks)} past conversations about {topic} - want me to show you what you said before?*"
 
         # Generate response
         response_text = await bedrock_claude_message(

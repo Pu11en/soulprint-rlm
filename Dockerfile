@@ -17,10 +17,12 @@ COPY processors/ ./processors/
 
 # Copy app
 COPY main.py .
+COPY prompt_helpers.py .
 
 # Verify all modules import correctly at build time (fail fast)
 RUN python -c "from adapters import download_conversations, update_user_profile, save_chunks_batch; print('Adapters OK')" && \
-    python -c "from processors.conversation_chunker import chunk_conversations; from processors.fact_extractor import extract_facts_parallel; from processors.memory_generator import generate_memory_section; from processors.v2_regenerator import regenerate_sections_v2; from processors.full_pass import run_full_pass_pipeline; print('Processors OK')"
+    python -c "from processors.conversation_chunker import chunk_conversations; from processors.fact_extractor import extract_facts_parallel; from processors.memory_generator import generate_memory_section; from processors.v2_regenerator import regenerate_sections_v2; from processors.full_pass import run_full_pass_pipeline; print('Processors OK')" && \
+    python -c "from prompt_helpers import clean_section, format_section; print('Prompt helpers OK')"
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
