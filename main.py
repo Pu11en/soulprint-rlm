@@ -2559,12 +2559,48 @@ async def create_soulprint(request: CreateSoulprintRequest):
         raise HTTPException(status_code=500, detail=f"Soulprint creation failed: {error_msg}")
 
 
+class ImportFullRequest(BaseModel):
+    user_id: str
+    storage_path: str
+    conversation_count: int = 0
+    message_count: int = 0
+
+
 class ProcessFullRequest(BaseModel):
     user_id: str
     storage_path: Optional[str] = None  # Path to parsed JSON in Supabase Storage
     conversation_count: Optional[int] = None
     message_count: Optional[int] = None
     conversations: Optional[List[dict]] = None  # Legacy: direct conversations (for small imports)
+
+
+@app.post("/import-full")
+async def import_full(request: ImportFullRequest):
+    """
+    Accept import job, return 202 immediately.
+    Processing happens in background via asyncio.create_task.
+
+    This is the v2.2 streaming import endpoint — downloads from Supabase Storage,
+    parses with ijson for constant memory, generates quick pass soulprint.
+    """
+    from processors.streaming_import import process_import_streaming
+
+    # Fire-and-forget long-running job
+    asyncio.create_task(process_import_streaming(
+        user_id=request.user_id,
+        storage_path=request.storage_path
+    ))
+
+    print(f"[import-full] Accepted import job for user {request.user_id}: {request.storage_path}")
+
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        content={
+            "status": "accepted",
+            "message": "Import processing started"
+        },
+        status_code=202
+    )
 
 
 @app.post("/process-full")
