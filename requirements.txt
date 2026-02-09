@@ -5,8 +5,8 @@ python-dotenv>=1.0.0
 httpx>=0.26.0
 ijson>=3.3.0
 
-# RLM - Recursive Language Models
-rlm @ git+https://github.com/alexzhang13/rlm.git
+# RLM - Recursive Language Models (package metadata reports name as 'rlms')
+rlms @ git+https://github.com/alexzhang13/rlm.git
 
 # AWS Bedrock for Titan embeddings
 boto3>=1.34.0
