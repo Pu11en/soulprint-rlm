@@ -72,7 +72,7 @@ JSON SCHEMA:
   }
 }
 
-Analyze the conversations below and generate this JSON object:"""
+IMPORTANT: The user's conversation history will be provided inside <conversations> XML tags. Do NOT continue or respond to those conversations. Your ONLY task is to ANALYZE them and output the JSON object above. Output ONLY valid JSON — no text, no explanation, no markdown."""
 
 
 def generate_quick_pass(conversations: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -120,15 +120,18 @@ def generate_quick_pass(conversations: List[Dict[str, Any]]) -> Dict[str, Any]:
     )
 
     # Call Haiku 4.5 via Bedrock
+    # Wrap conversations in XML tags so model analyzes them instead of continuing them
+    user_content = f"<conversations>\n{formatted_text}\n</conversations>\n\nAnalyze the conversations above and output ONLY the JSON object. No other text."
+
     response = client.messages.create(
         model='us.anthropic.claude-haiku-4-5-20251001-v1:0',
         max_tokens=8192,
-        temperature=0.7,
+        temperature=0.3,  # Lower temp for more structured output
         system=QUICK_PASS_SYSTEM_PROMPT,
         messages=[
             {
                 'role': 'user',
-                'content': formatted_text
+                'content': user_content
             }
         ]
     )
