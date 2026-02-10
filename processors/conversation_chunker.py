@@ -5,6 +5,8 @@ Splits conversations into ~2000 token segments with overlap for fact extraction 
 from datetime import datetime
 from typing import List, Dict
 
+from .dag_parser import extract_active_path
+
 
 def estimate_tokens(text: str) -> int:
     """
@@ -58,70 +60,20 @@ def format_conversation(conversation: dict) -> str:
 
         return "\n".join(formatted_lines)
 
-    # Otherwise, handle ChatGPT export format with mapping
-    if "mapping" not in conversation:
+    # Otherwise, handle ChatGPT export format with mapping (or no messages)
+    # Use DAG traversal to extract only active conversation path
+    parsed_messages = extract_active_path(conversation)
+
+    if not parsed_messages:
         return f"# {title}\n[No messages found]"
 
-    mapping = conversation["mapping"]
+    for msg in parsed_messages:
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
 
-    # Extract messages in order by traversing the mapping tree
-    # The mapping is a node tree where each node has a message and children
-    messages = []
-
-    def traverse_mapping(node_id: str, visited: set):
-        """Recursively traverse the mapping tree to extract messages in order"""
-        if node_id in visited or node_id not in mapping:
-            return
-
-        visited.add(node_id)
-        node = mapping[node_id]
-
-        # Extract message from node
-        if "message" in node and node["message"]:
-            msg = node["message"]
-            author = msg.get("author", {})
-            role = author.get("role", "unknown")
-
-            # Skip system messages
-            if role == "system":
-                return
-
-            content_data = msg.get("content", {})
-            if isinstance(content_data, dict):
-                parts = content_data.get("parts", [])
-                content = " ".join(str(part) for part in parts if part)
-            else:
-                content = str(content_data) if content_data else ""
-
-            if content:
-                # Truncate very long messages
-                if len(content) > 5000:
-                    content = content[:5000] + "... [truncated]"
-
-                messages.append({
-                    "role": role,
-                    "content": content,
-                    "create_time": msg.get("create_time", 0)
-                })
-
-        # Traverse children
-        children = node.get("children", [])
-        for child_id in children:
-            traverse_mapping(child_id, visited)
-
-    # Find root node (no parent) and traverse
-    for node_id, node in mapping.items():
-        if not node.get("parent"):
-            traverse_mapping(node_id, set())
-            break
-
-    # Sort by create_time if available
-    messages.sort(key=lambda m: m.get("create_time", 0))
-
-    # Format messages
-    for msg in messages:
-        role = msg["role"]
-        content = msg["content"]
+        # Truncate very long messages
+        if len(content) > 5000:
+            content = content[:5000] + "... [truncated]"
 
         if role == "user":
             formatted_lines.append(f"User: {content}")

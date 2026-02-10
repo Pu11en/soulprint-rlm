@@ -23,6 +23,8 @@ from typing import Optional
 import httpx
 import ijson
 
+from .dag_parser import extract_active_path
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
@@ -98,30 +100,50 @@ def parse_conversations_streaming(file_path: str) -> list:
     Returns:
         List of parsed conversation dicts
     """
-    conversations = []
+    raw_convos = []
 
     with open(file_path, "rb") as f:
         try:
             # Try bare array format first (most common)
             parser = ijson.items(f, "item")
-            conversations = list(parser)
+            raw_convos = list(parser)
 
             # If no items found, might be wrapped format
-            if len(conversations) == 0:
+            if len(raw_convos) == 0:
                 f.seek(0)  # Reset file pointer
                 parser = ijson.items(f, "conversations.item")
-                conversations = list(parser)
+                raw_convos = list(parser)
         except (ijson.JSONError, ijson.common.IncompleteJSONError):
             # If bare array fails, try wrapped format
             f.seek(0)  # Reset file pointer
             try:
                 parser = ijson.items(f, "conversations.item")
-                conversations = list(parser)
+                raw_convos = list(parser)
             except Exception as e:
                 # Both formats failed
                 print(f"[streaming_import] ERROR: Both parse formats failed: {e}")
 
-    print(f"[streaming_import] Parsed {len(conversations)} conversations from file")
+    # Process each conversation with DAG traversal
+    conversations = []
+    for raw_convo in raw_convos:
+        parsed_messages = extract_active_path(raw_convo)
+
+        if parsed_messages:
+            create_time = raw_convo.get("create_time")
+            if create_time and isinstance(create_time, (int, float)) and create_time > 0:
+                created_at = datetime.fromtimestamp(create_time, tz=timezone.utc).isoformat()
+            else:
+                created_at = datetime.now(timezone.utc).isoformat()
+
+            conversations.append({
+                "id": raw_convo.get("id"),
+                "title": raw_convo.get("title", "Untitled"),
+                "createdAt": created_at,
+                "messages": parsed_messages,
+            })
+
+    total_messages = sum(len(c["messages"]) for c in conversations)
+    print(f"[streaming_import] Parsed {len(conversations)} conversations with DAG traversal ({total_messages} total messages)")
     return conversations
 
 
