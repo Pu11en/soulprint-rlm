@@ -13,6 +13,7 @@ Uses a temporary file approach for TRUE constant-memory processing:
 This allows processing 300MB+ exports without OOM on Render.
 """
 
+import asyncio
 import json
 import os
 import tempfile
@@ -147,6 +148,77 @@ def parse_conversations_streaming(file_path: str) -> list:
     return conversations
 
 
+async def trigger_full_pass(user_id: str, storage_path: str, conversation_count: int):
+    """Fire-and-forget full pass after quick pass succeeds.
+
+    Runs asynchronously — does not block chat access.
+    Creates conversation chunks, extracts facts, generates MEMORY section,
+    and regenerates v2 soulprint sections.
+    """
+    try:
+        # Mark full pass as processing
+        async with httpx.AsyncClient() as client:
+            await client.patch(
+                f"{SUPABASE_URL}/rest/v1/user_profiles?user_id=eq.{user_id}",
+                json={
+                    "full_pass_status": "processing",
+                    "full_pass_error": None,
+                },
+                headers={
+                    "apikey": SUPABASE_SERVICE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+            )
+
+        from .full_pass import run_full_pass_pipeline
+        await run_full_pass_pipeline(
+            user_id=user_id,
+            storage_path=storage_path,
+            conversation_count=conversation_count,
+        )
+
+        # Mark complete
+        async with httpx.AsyncClient() as client:
+            await client.patch(
+                f"{SUPABASE_URL}/rest/v1/user_profiles?user_id=eq.{user_id}",
+                json={
+                    "full_pass_status": "complete",
+                    "full_pass_completed_at": datetime.now(timezone.utc).isoformat(),
+                },
+                headers={
+                    "apikey": SUPABASE_SERVICE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+            )
+        print(f"[streaming_import] Full pass complete for user {user_id}")
+
+    except Exception as e:
+        error_msg = str(e)[:500]
+        print(f"[streaming_import] Full pass failed for user {user_id}: {error_msg}")
+        traceback.print_exc()
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.patch(
+                    f"{SUPABASE_URL}/rest/v1/user_profiles?user_id=eq.{user_id}",
+                    json={
+                        "full_pass_status": "failed",
+                        "full_pass_error": error_msg,
+                    },
+                    headers={
+                        "apikey": SUPABASE_SERVICE_KEY,
+                        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                        "Content-Type": "application/json",
+                        "Prefer": "return=minimal",
+                    },
+                )
+        except Exception:
+            pass
+
+
 async def process_import_streaming(user_id: str, storage_path: str):
     """Complete streaming import pipeline with TRUE constant memory.
 
@@ -232,6 +304,11 @@ async def process_import_streaming(user_id: str, storage_path: str):
                 )
 
             print(f"[streaming_import] Quick pass complete for user {user_id}: ai_name={ai_name}, archetype={archetype}")
+
+            # Fire-and-forget full pass (chunks, facts, memory, v2 sections)
+            # User can chat immediately with quick pass results while this runs
+            asyncio.create_task(trigger_full_pass(user_id, storage_path, len(conversations)))
+            print(f"[streaming_import] Full pass triggered for user {user_id}")
         else:
             # Quick pass failed - mark as FAILED with error (BLOCKER 1 FIX)
             print(f"[streaming_import] Quick pass returned None for user {user_id} -- marking as failed")
