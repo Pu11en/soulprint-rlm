@@ -75,92 +75,90 @@ JSON SCHEMA:
 Analyze the conversations below and generate this JSON object:"""
 
 
-def generate_quick_pass(conversations: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def generate_quick_pass(conversations: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Generate structured personality sections from ChatGPT conversations.
 
     Samples the richest conversations, sends them to Haiku 4.5 for analysis,
-    and returns the parsed result. Returns None on any failure.
+    and returns the parsed result. Raises on failure with descriptive error.
 
     Args:
         conversations: All parsed conversations from the ChatGPT export
 
     Returns:
-        QuickPassResult dict with all 5 sections, or None on failure
+        QuickPassResult dict with all 5 sections
+
+    Raises:
+        ValueError: If generation fails (with descriptive message for user)
     """
+    # Pre-flight: check AWS credentials
+    aws_key = os.environ.get('AWS_ACCESS_KEY_ID')
+    aws_secret = os.environ.get('AWS_SECRET_ACCESS_KEY')
+    aws_region = os.environ.get('AWS_REGION', 'us-east-1')
+
+    if not aws_key or not aws_secret:
+        raise ValueError(f"AWS Bedrock credentials not configured (key={'set' if aws_key else 'MISSING'}, secret={'set' if aws_secret else 'MISSING'}, region={aws_region})")
+
+    # Sample the richest conversations within token budget
+    sampled = sample_conversations(conversations)
+    print(f"[quick_pass] Conversations sampled: {len(conversations)} input -> {len(sampled)} sampled")
+
+    # Format as readable text for the prompt
+    formatted_text = format_conversations_for_prompt(sampled)
+
+    if not formatted_text or len(formatted_text.strip()) == 0:
+        raise ValueError(f"No conversation text after formatting ({len(sampled)} sampled conversations had no message content)")
+
+    approx_tokens = len(formatted_text) // 4
+    print(f"[quick_pass] Calling Haiku 4.5: {len(formatted_text)} chars (~{approx_tokens} tokens)")
+
+    # Initialize Bedrock client
+    client = AnthropicBedrock(
+        aws_region=aws_region,
+        aws_access_key=aws_key,
+        aws_secret_key=aws_secret,
+    )
+
+    # Call Haiku 4.5 via Bedrock
+    response = client.messages.create(
+        model='us.anthropic.claude-haiku-4-5-20251001-v1:0',
+        max_tokens=8192,
+        temperature=0.7,
+        system=QUICK_PASS_SYSTEM_PROMPT,
+        messages=[
+            {
+                'role': 'user',
+                'content': formatted_text
+            }
+        ]
+    )
+
+    # Extract text from response
+    if not response.content or len(response.content) == 0:
+        raise ValueError("Empty response from Bedrock Haiku 4.5")
+
+    result_text = response.content[0].text
+
+    # Parse JSON response
+    json_str = result_text.strip()
+    if json_str.startswith('```json'):
+        json_str = json_str[7:]
+    elif json_str.startswith('```'):
+        json_str = json_str[3:]
+    if json_str.endswith('```'):
+        json_str = json_str[:-3]
+    json_str = json_str.strip()
+
     try:
-        # Sample the richest conversations within token budget
-        sampled = sample_conversations(conversations)
-        print(f"[quick_pass] Conversations sampled: {len(conversations)} input -> {len(sampled)} sampled")
+        result = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Bedrock returned invalid JSON: {e} — first 200 chars: {result_text[:200]}")
 
-        # Format as readable text for the prompt
-        formatted_text = format_conversations_for_prompt(sampled)
+    # Basic validation that required sections exist
+    required_sections = ['soul', 'identity', 'user', 'agents', 'tools']
+    missing = [s for s in required_sections if s not in result]
+    if missing:
+        raise ValueError(f"Bedrock response missing sections: {missing}")
 
-        if not formatted_text or len(formatted_text.strip()) == 0:
-            print("[quick_pass] WARNING: No conversation text after formatting -- cannot generate quick pass")
-            return None
-
-        approx_tokens = len(formatted_text) // 4
-        print(f"[quick_pass] Calling Haiku 4.5: {len(formatted_text)} chars (~{approx_tokens} tokens)")
-
-        # Initialize Bedrock client
-        client = AnthropicBedrock(
-            aws_region=os.environ.get('AWS_REGION', 'us-east-1'),
-            aws_access_key=os.environ.get('AWS_ACCESS_KEY_ID'),
-            aws_secret_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
-        )
-
-        # Call Haiku 4.5 via Bedrock
-        response = client.messages.create(
-            model='us.anthropic.claude-haiku-4-5-20251001-v1:0',
-            max_tokens=8192,
-            temperature=0.7,
-            system=QUICK_PASS_SYSTEM_PROMPT,
-            messages=[
-                {
-                    'role': 'user',
-                    'content': formatted_text
-                }
-            ]
-        )
-
-        # Extract text from response
-        if not response.content or len(response.content) == 0:
-            print("[quick_pass] ERROR: Empty response from Bedrock")
-            return None
-
-        result_text = response.content[0].text
-
-        # Parse JSON response
-        try:
-            # Clean up potential markdown code blocks
-            json_str = result_text.strip()
-            if json_str.startswith('```json'):
-                json_str = json_str[7:]
-            elif json_str.startswith('```'):
-                json_str = json_str[3:]
-            if json_str.endswith('```'):
-                json_str = json_str[:-3]
-            json_str = json_str.strip()
-
-            result = json.loads(json_str)
-
-            # Basic validation that required sections exist
-            required_sections = ['soul', 'identity', 'user', 'agents', 'tools']
-            for section in required_sections:
-                if section not in result:
-                    print(f"[quick_pass] ERROR: Missing required section '{section}' in response")
-                    return None
-
-            print("[quick_pass] Quick pass generation succeeded")
-            return result
-
-        except json.JSONDecodeError as e:
-            print(f"[quick_pass] ERROR: Failed to parse JSON response: {e}")
-            print(f"[quick_pass] Response text: {result_text[:500]}...")
-            return None
-
-    except Exception as e:
-        # Never throw -- import must not fail because of quick pass
-        print(f"[quick_pass] ERROR: Quick pass generation failed: {str(e)}")
-        return None
+    print("[quick_pass] Quick pass generation succeeded")
+    return result

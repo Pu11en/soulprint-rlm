@@ -263,73 +263,50 @@ async def process_import_streaming(user_id: str, storage_path: str):
         # Stage 3: Quick Pass (50-100%)
         print(f"[streaming_import] Generating quick pass for user {user_id} ({len(conversations)} conversations)")
         from .quick_pass import generate_quick_pass
-        quick_pass_result = generate_quick_pass(conversations)  # synchronous
+        quick_pass_result = generate_quick_pass(conversations)  # synchronous, raises on failure
 
-        if quick_pass_result:
-            # Save to database (matching process-server.ts structure)
-            # soul_md, identity_md, user_md, agents_md, tools_md as JSON strings
-            soul_md = json.dumps(quick_pass_result.get("soul", {}))
-            identity_md = json.dumps(quick_pass_result.get("identity", {}))
-            user_md = json.dumps(quick_pass_result.get("user", {}))
-            agents_md = json.dumps(quick_pass_result.get("agents", {}))
-            tools_md = json.dumps(quick_pass_result.get("tools", {}))
+        # Save to database (matching process-server.ts structure)
+        soul_md = json.dumps(quick_pass_result.get("soul", {}))
+        identity_md = json.dumps(quick_pass_result.get("identity", {}))
+        user_md = json.dumps(quick_pass_result.get("user", {}))
+        agents_md = json.dumps(quick_pass_result.get("agents", {}))
+        tools_md = json.dumps(quick_pass_result.get("tools", {}))
 
-            ai_name = quick_pass_result.get("identity", {}).get("ai_name", "Nova")
-            archetype = quick_pass_result.get("identity", {}).get("archetype", "Analyzing...")
+        ai_name = quick_pass_result.get("identity", {}).get("ai_name", "Nova")
+        archetype = quick_pass_result.get("identity", {}).get("archetype", "Analyzing...")
 
-            # Update user_profiles with quick pass results
-            async with httpx.AsyncClient() as client:
-                await client.patch(
-                    f"{SUPABASE_URL}/rest/v1/user_profiles?user_id=eq.{user_id}",
-                    json={
-                        "soul_md": soul_md,
-                        "identity_md": identity_md,
-                        "user_md": user_md,
-                        "agents_md": agents_md,
-                        "tools_md": tools_md,
-                        "ai_name": ai_name,
-                        "archetype": archetype,
-                        "import_status": "quick_ready",
-                        "import_error": None,
-                        "progress_percent": 100,
-                        "import_stage": "Complete",
-                        "updated_at": datetime.now(timezone.utc).isoformat(),
-                    },
-                    headers={
-                        "apikey": SUPABASE_SERVICE_KEY,
-                        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-                        "Content-Type": "application/json",
-                        "Prefer": "return=minimal",
-                    },
-                )
+        # Update user_profiles with quick pass results
+        async with httpx.AsyncClient() as client:
+            await client.patch(
+                f"{SUPABASE_URL}/rest/v1/user_profiles?user_id=eq.{user_id}",
+                json={
+                    "soul_md": soul_md,
+                    "identity_md": identity_md,
+                    "user_md": user_md,
+                    "agents_md": agents_md,
+                    "tools_md": tools_md,
+                    "ai_name": ai_name,
+                    "archetype": archetype,
+                    "import_status": "quick_ready",
+                    "import_error": None,
+                    "progress_percent": 100,
+                    "import_stage": "Complete",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                headers={
+                    "apikey": SUPABASE_SERVICE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+            )
 
-            print(f"[streaming_import] Quick pass complete for user {user_id}: ai_name={ai_name}, archetype={archetype}")
+        print(f"[streaming_import] Quick pass complete for user {user_id}: ai_name={ai_name}, archetype={archetype}")
 
-            # Fire-and-forget full pass (chunks, facts, memory, v2 sections)
-            # User can chat immediately with quick pass results while this runs
-            asyncio.create_task(trigger_full_pass(user_id, storage_path, len(conversations)))
-            print(f"[streaming_import] Full pass triggered for user {user_id}")
-        else:
-            # Quick pass failed - mark as FAILED with error (BLOCKER 1 FIX)
-            print(f"[streaming_import] Quick pass returned None for user {user_id} -- marking as failed")
-            await update_progress(user_id, 100, "Failed")
-            async with httpx.AsyncClient() as client:
-                await client.patch(
-                    f"{SUPABASE_URL}/rest/v1/user_profiles?user_id=eq.{user_id}",
-                    json={
-                        "import_status": "failed",
-                        "import_error": "Quick pass generation failed -- no personality data could be extracted",
-                        "progress_percent": 100,
-                        "import_stage": "Failed",
-                        "updated_at": datetime.now(timezone.utc).isoformat(),
-                    },
-                    headers={
-                        "apikey": SUPABASE_SERVICE_KEY,
-                        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-                        "Content-Type": "application/json",
-                        "Prefer": "return=minimal",
-                    },
-                )
+        # Fire-and-forget full pass (chunks, facts, memory, v2 sections)
+        # User can chat immediately with quick pass results while this runs
+        asyncio.create_task(trigger_full_pass(user_id, storage_path, len(conversations)))
+        print(f"[streaming_import] Full pass triggered for user {user_id}")
 
     except Exception as e:
         # Update status to failed with specific error message

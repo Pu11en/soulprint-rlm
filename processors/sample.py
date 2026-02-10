@@ -92,6 +92,9 @@ def sample_conversations(
 
     # Select conversations within token budget
     target_chars = target_tokens * CHARS_PER_TOKEN
+    # Hard limit: Haiku 4.5 has 200K token context, system prompt ~2K tokens
+    # At 4 chars/token, that's ~792K chars max. Use 600K to be safe.
+    ABSOLUTE_CHAR_LIMIT = 600_000
     selected = []
     total_chars = 0
 
@@ -99,9 +102,14 @@ def sample_conversations(
         conv = item['conv']
         chars = item['chars']
 
+        # Never exceed absolute limit (prevents blowing past model context)
+        if total_chars + chars > ABSOLUTE_CHAR_LIMIT and len(selected) > 0:
+            break
+
         if total_chars + chars > target_chars:
-            # Force-include up to MIN_SELECTED even if over budget
-            if len(selected) < MIN_SELECTED:
+            # Force-include up to MIN_SELECTED, but only if this single
+            # conversation won't blow past the absolute limit on its own
+            if len(selected) < MIN_SELECTED and total_chars + chars <= ABSOLUTE_CHAR_LIMIT:
                 selected.append(conv)
                 total_chars += chars
                 continue
@@ -173,6 +181,13 @@ def format_conversations_for_prompt(conversations: List[Dict[str, Any]]) -> str:
         blocks.append('\n'.join([header] + message_lines))
 
     result = '\n\n'.join(blocks)
+
+    # Safety truncation: Haiku 4.5 has 200K token context (~800K chars).
+    # System prompt uses ~2K tokens. Cap user content at 180K tokens = 720K chars.
+    MAX_PROMPT_CHARS = 720_000
+    if len(result) > MAX_PROMPT_CHARS:
+        print(f"[format_conversations_for_prompt] Truncating from {len(result)} to {MAX_PROMPT_CHARS} chars (model context limit)")
+        result = result[:MAX_PROMPT_CHARS] + "\n\n[... remaining conversations truncated to fit model context ...]"
 
     print(f"[format_conversations_for_prompt] Formatted {len(conversations)} conversations, {len(result)} chars")
 
