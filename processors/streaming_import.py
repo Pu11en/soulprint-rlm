@@ -18,6 +18,7 @@ import json
 import os
 import tempfile
 import traceback
+import zipfile
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -87,6 +88,36 @@ async def download_streaming(storage_path: str, temp_file_path: str):
     print(f"[streaming_import] Downloaded to temp file: {temp_file_path}")
 
 
+def extract_if_zip(file_path: str, file_type: str = 'json') -> str:
+    """If file is a ZIP, extract conversations.json. Otherwise return as-is."""
+    if file_type != 'zip' and not file_path.endswith('.zip'):
+        return file_path
+
+    # Also auto-detect by magic bytes: ZIP starts with PK (0x504B)
+    with open(file_path, 'rb') as f:
+        magic = f.read(2)
+
+    if magic != b'PK':
+        return file_path  # Not actually a ZIP
+
+    extract_dir = file_path + '_extracted'
+    os.makedirs(extract_dir, exist_ok=True)
+
+    with zipfile.ZipFile(file_path, 'r') as zip_ref:
+        # Find conversations.json (might be in root or subfolder)
+        json_files = [n for n in zip_ref.namelist() if n.endswith('conversations.json')]
+        if not json_files:
+            raise ValueError("No conversations.json found in ZIP")
+
+        zip_ref.extract(json_files[0], extract_dir)
+        extracted_path = os.path.join(extract_dir, json_files[0])
+
+    # Remove original ZIP to free disk space
+    os.unlink(file_path)
+    print(f"[streaming_import] Extracted conversations.json from ZIP: {extracted_path}")
+    return extracted_path
+
+
 def parse_conversations_streaming(file_path: str) -> list:
     """Parse ChatGPT conversations.json with ijson from file (constant memory).
 
@@ -148,7 +179,7 @@ def parse_conversations_streaming(file_path: str) -> list:
     return conversations
 
 
-async def trigger_full_pass(user_id: str, storage_path: str, conversation_count: int):
+async def trigger_full_pass(user_id: str, storage_path: str, conversation_count: int, file_type: str = 'json'):
     """Fire-and-forget full pass after quick pass succeeds.
 
     Runs asynchronously — does not block chat access.
@@ -177,6 +208,7 @@ async def trigger_full_pass(user_id: str, storage_path: str, conversation_count:
             user_id=user_id,
             storage_path=storage_path,
             conversation_count=conversation_count,
+            file_type=file_type,
         )
 
         # Mark complete
@@ -219,11 +251,12 @@ async def trigger_full_pass(user_id: str, storage_path: str, conversation_count:
             pass
 
 
-async def process_import_streaming(user_id: str, storage_path: str):
+async def process_import_streaming(user_id: str, storage_path: str, file_type: str = 'json'):
     """Complete streaming import pipeline with TRUE constant memory.
 
     Uses temporary file approach:
     1. Stream httpx download to temp file (chunk-by-chunk, no accumulation)
+    1.5. If ZIP, extract conversations.json from it
     2. Pass temp file to ijson for parsing (file handle, no memory load)
     3. Generate quick pass soulprint from parsed conversations
     4. Save results to database
@@ -237,18 +270,23 @@ async def process_import_streaming(user_id: str, storage_path: str):
     Args:
         user_id: The user's ID
         storage_path: Full Supabase Storage path (e.g. "user-imports/uid/raw-123.json")
+        file_type: 'json' or 'zip' — if 'zip', extract conversations.json server-side
     """
     temp_file_path: Optional[str] = None
 
     try:
         # Create temporary file
-        fd, temp_file_path = tempfile.mkstemp(suffix=".json", prefix="soulprint_import_")
+        suffix = ".zip" if file_type == 'zip' else ".json"
+        fd, temp_file_path = tempfile.mkstemp(suffix=suffix, prefix="soulprint_import_")
         os.close(fd)  # Close file descriptor, we'll use path
 
         # Stage 1: Download to temp file (0-20%)
         await update_progress(user_id, 0, "Downloading export")
-        print(f"[streaming_import] Starting download for user {user_id}: {storage_path}")
+        print(f"[streaming_import] Starting download for user {user_id}: {storage_path} (file_type={file_type})")
         await download_streaming(storage_path, temp_file_path)
+
+        # Stage 1.5: Extract if ZIP
+        temp_file_path = extract_if_zip(temp_file_path, file_type)
         await update_progress(user_id, 20, "Parsing conversations")
 
         # Stage 2: Parse from temp file (20-50%)
@@ -275,6 +313,22 @@ async def process_import_streaming(user_id: str, storage_path: str):
         ai_name = quick_pass_result.get("identity", {}).get("ai_name", "Nova")
         archetype = quick_pass_result.get("identity", {}).get("archetype", "Analyzing...")
 
+        # Build soulprint_text from sections (used by chat route as primary personality check)
+        soulprint_text = f"""## Communication Style & Personality
+{soul_md}
+
+## AI Identity
+{identity_md}
+
+## About the User
+{user_md}
+
+## How I Operate
+{agents_md}
+
+## Capabilities
+{tools_md}"""
+
         # Update user_profiles with quick pass results
         async with httpx.AsyncClient() as client:
             await client.patch(
@@ -285,6 +339,7 @@ async def process_import_streaming(user_id: str, storage_path: str):
                     "user_md": user_md,
                     "agents_md": agents_md,
                     "tools_md": tools_md,
+                    "soulprint_text": soulprint_text,
                     "ai_name": ai_name,
                     "archetype": archetype,
                     "import_status": "quick_ready",
@@ -305,7 +360,7 @@ async def process_import_streaming(user_id: str, storage_path: str):
 
         # Fire-and-forget full pass (chunks, facts, memory, v2 sections)
         # User can chat immediately with quick pass results while this runs
-        asyncio.create_task(trigger_full_pass(user_id, storage_path, len(conversations)))
+        asyncio.create_task(trigger_full_pass(user_id, storage_path, len(conversations), file_type))
         print(f"[streaming_import] Full pass triggered for user {user_id}")
 
     except Exception as e:
@@ -336,10 +391,17 @@ async def process_import_streaming(user_id: str, storage_path: str):
             print(f"[streaming_import] ERROR: Failed to update error status for {user_id}: {update_err}")
 
     finally:
-        # Clean up temp file
-        if temp_file_path and os.path.exists(temp_file_path):
+        # Clean up temp files and any extraction directory
+        if temp_file_path:
+            import shutil
             try:
-                os.unlink(temp_file_path)
-                print(f"[streaming_import] Cleaned up temp file: {temp_file_path}")
+                if os.path.exists(temp_file_path):
+                    os.unlink(temp_file_path)
+                # Clean up extraction directories (pattern: *_extracted)
+                # temp_file_path may point inside an _extracted dir after ZIP extraction
+                parent = os.path.dirname(temp_file_path)
+                if parent.endswith('_extracted') and os.path.isdir(parent):
+                    shutil.rmtree(parent, ignore_errors=True)
+                print(f"[streaming_import] Cleaned up temp files: {temp_file_path}")
             except Exception:
                 pass  # Best effort cleanup
